@@ -394,6 +394,8 @@ transform_dk1:
       target_height: 360
     - <<: *crop_cfg
       apply_to: ${modality_config_dk1.video.modality_keys}
+      height: 360
+      width: 640
     - <<: *resize_cfg
       apply_to: ${modality_config_dk1.video.modality_keys}
     - <<: *color_jitter_cfg

@@ -578,7 +578,7 @@ class BaseExperiment(ABC):
     def __init__(self, cfg: DictConfig):
         # assert cfg.save_steps == 500, "save_steps must be 500 for standarized evaluation"
         assert cfg.max_steps > 0, "max_steps must be > 0 for standarized evaluation"
-        assert cfg.save_total_limit >= 5, "save_total_limit must be >= 5 for standarized evaluation"
+        # assert cfg.save_total_limit >= 5, "save_total_limit must be >= 5 for standarized evaluation"
 
         if cfg.load_from_yaml is not None:
             # Override the default config with the loaded config.

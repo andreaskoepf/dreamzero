@@ -58,11 +58,8 @@ class VideoResolutionNormalize(ModalityTransform):
             self._per_key_ops[key] = (resize_h, resize_w, th, tw)
 
     def apply(self, data: dict[str, Any]) -> dict[str, Any]:
+        tw, th = self.target_width, self.target_height
         for key in self.apply_to:
-            ops = self._per_key_ops.get(key)
-            if ops is None:
-                continue
-            resize_h, resize_w, crop_h, crop_w = ops
             view = data[key]
             is_tensor = isinstance(view, torch.Tensor)
             if not is_tensor:
@@ -74,9 +71,20 @@ class VideoResolutionNormalize(ModalityTransform):
                 b, t, c, h, w = view.shape
                 view = view.reshape(b * t, c, h, w)
             elif view.ndim == 4:
-                pass  # (T, C, H, W)
+                t, c, h, w = view.shape
             else:
                 raise ValueError(f"Unexpected view ndim={view.ndim} for {key}")
+
+            # Skip if already at target resolution
+            if h == th and w == tw:
+                continue
+
+            # Compute resize dynamically from actual input resolution
+            scale_w = tw / w
+            scale_h = th / h
+            scale = max(scale_w, scale_h)
+            resize_w = max(int(round(w * scale)), tw)
+            resize_h = max(int(round(h * scale)), th)
 
             # Step 1+2: resize (smallest-side fit)
             view = torch.nn.functional.interpolate(
@@ -86,12 +94,12 @@ class VideoResolutionNormalize(ModalityTransform):
 
             # Step 3: center-crop to exact target
             cur_h, cur_w = view.shape[-2], view.shape[-1]
-            top = (cur_h - crop_h) // 2
-            left = (cur_w - crop_w) // 2
-            view = view[:, :, top : top + crop_h, left : left + crop_w]
+            top = (cur_h - th) // 2
+            left = (cur_w - tw) // 2
+            view = view[:, :, top : top + th, left : left + tw]
 
             if len(orig_shape) == 5:
-                view = view.reshape(b, t, c, crop_h, crop_w)
+                view = view.reshape(b, t, c, th, tw)
 
             if not is_tensor:
                 view = view.numpy()
@@ -366,17 +374,6 @@ class VideoCrop(VideoTransform):
 
     def check_input(self, data: dict[str, Any]):
         super().check_input(data)
-        # Check the input resolution
-        for key in self.apply_to:
-            if self.backend == "torchvision":
-                height, width = data[key].shape[-2:]
-            elif self.backend == "albumentations":
-                height, width = data[key].shape[-3:-1]
-            else:
-                raise ValueError(f"Backend {self.backend} not supported")
-            assert (
-                height == self.height and width == self.width
-            ), f"Video {key} has invalid shape {height, width}, expected {self.height, self.width}"
 
 
 class VideoRandomErasing(VideoTransform):
@@ -659,14 +656,26 @@ class VideoToTensor(VideoTransform):
             assert (
                 data[key].dtype == np.uint8
             ), f"Video {key} must have dtype uint8, got {data[key].dtype}"
-            input_resolution = data[key].shape[-3:-1][::-1]
-            if key in self.original_resolutions:
-                expected_resolution = self.original_resolutions[key]
-            else:
-                expected_resolution = input_resolution
-            assert (
-                input_resolution == expected_resolution
-            ), f"Video {key} has invalid resolution {input_resolution}, expected {expected_resolution}. Full shape: {data[key].shape}"
+
+    def apply(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Apply to_tensor per-view individually to handle mixed resolutions.
+
+        The base VideoTransform.apply concatenates all views before transforming,
+        which fails when views have different resolutions. VideoToTensor just
+        converts numpy to tensor, so per-view application is fine.
+        """
+        try:
+            self.check_input(data)
+        except AssertionError as e:
+            raise ValueError(
+                f"Input data does not match the expected format for {self.__class__.__name__}: {e}"
+            ) from e
+        transform = self.train_transform if self.training else self.eval_transform
+        if transform is None:
+            return data
+        for key in self.apply_to:
+            data[key] = transform(data[key])
+        return data
 
     @staticmethod
     def to_tensor(frames: np.ndarray, output_on_cuda: bool) -> torch.Tensor:
