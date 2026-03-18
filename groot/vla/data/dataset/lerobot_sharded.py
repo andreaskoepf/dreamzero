@@ -11,6 +11,7 @@ from torch.utils.data import IterableDataset, get_worker_info
 import yaml
 
 from groot.vla.common.utils import get_frames_by_timestamps
+from groot.vla.common.utils.misc.video_utils import get_frames_by_indices
 
 from .lerobot import LE_ROBOT_EPISODE_FILENAME, LeRobotMixtureDataset, LeRobotSingleDataset
 
@@ -115,7 +116,7 @@ class ShardedLeRobotSingleDataset(LeRobotSingleDataset):
         for trajectory_id in trajectory_ids:
             sharded_trajectories[-1].append(trajectory_id)
             curr_num_steps += len(self.step_filter[trajectory_id])
-            if curr_num_steps > cutoffs[curr_shard_index]:
+            while curr_shard_index < len(cutoffs) and curr_num_steps > cutoffs[curr_shard_index]:
                 sharded_trajectories.append([])
                 curr_shard_index += 1
                 shard_lengths.append(curr_num_steps - last_num_steps)
@@ -335,10 +336,17 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
         self.num_steps_per_shard = num_steps_per_shard
         self.all_video_paths = self.get_all_video_paths()
         self.all_parquet_paths = self.get_all_parquet_paths()
+        # Build video frame map: for each camera key, list of (file_path, cum_start, num_frames)
+        # Handles LeRobot DROID format where video files != parquet files
+        self.video_frame_map = self._build_video_frame_map()
         self.sharded_trajectories, self.shard_lengths = self.generate_shards()
 
         # Set shard caching properties
         self.shard_start_indices: dict[int, int] | None = None
+        self.shard_window_starts: dict[int, int] | None = None
+        self.shard_window_sizes: dict[int, int] | None = None
+        self.shard_df_start_rows: dict[int, int] | None = None
+        self.shard_df_sizes: dict[int, int] | None = None
         self.cached_shard: dict[str, np.ndarray] | None = None
         self.cached_df: pd.DataFrame | None = None
         self._executor = ThreadPoolExecutor(max_workers=1)
@@ -394,6 +402,126 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
             for trajectory_id in self.trajectory_ids
         }
 
+    def _build_video_frame_map(self) -> dict[str, list[tuple[Path, int, int]]]:
+        """Build a map from camera key to list of (video_file_path, cumulative_start, num_frames).
+
+        Handles LeRobot DROID format where video files are packed (multiple episodes per file)
+        and the number of video files may differ from the number of parquet files.
+        Uses a JSON cache file to avoid re-scanning video files on every startup.
+        """
+        cache_path = self.dataset_path / "meta" / "video_frame_map.json"
+
+        # Try loading from cache first
+        if cache_path.exists():
+            try:
+                cache_data = json.loads(cache_path.read_text())
+                frame_map: dict[str, list[tuple[Path, int, int]]] = {}
+                for key, entries in cache_data.items():
+                    frame_map[key] = [
+                        (Path(e["path"]), e["cum_start"], e["num_frames"])
+                        for e in entries
+                    ]
+                total = sum(e[2] for entries in frame_map.values() for e in entries[:1])
+                print(f"  Loaded video frame map from cache: {cache_path.name} ({len(frame_map)} keys)")
+                return frame_map
+            except Exception as exc:
+                print(f"  Warning: failed to load video frame map cache: {exc}")
+
+        try:
+            import decord
+        except ImportError:
+            print("Warning: decord not available for video frame map, falling back to empty map")
+            return {}
+
+        frame_map = {}
+        cache_data = {}
+        for key in self.modality_keys.get("video", []):
+            assert key.startswith("video."), f"Video key must start with 'video.', got {key}"
+            cam_name = key.replace("video.", "")
+            original_key = self.lerobot_modality_meta.video[cam_name].original_key
+            if original_key is None:
+                original_key = cam_name
+            video_dir = self.dataset_path / "videos" / original_key / "chunk-000"
+            if not video_dir.exists():
+                print(f"Warning: video dir not found: {video_dir}")
+                continue
+            video_files = sorted(video_dir.glob("file-*.mp4"))
+            entries = []
+            cache_entries = []
+            cum_start = 0
+            for vf in video_files:
+                vr = decord.VideoReader(str(vf))
+                n_frames = len(vr)
+                entries.append((vf, cum_start, n_frames))
+                cache_entries.append({"path": str(vf), "cum_start": cum_start, "num_frames": n_frames})
+                cum_start += n_frames
+            frame_map[key] = entries
+            cache_data[key] = cache_entries
+            print(f"  Video frame map for {key}: {len(entries)} files, {cum_start} total frames")
+
+        # Save cache (only one process needs to write; race condition is benign)
+        try:
+            cache_path.write_text(json.dumps(cache_data, indent=2))
+        except Exception:
+            pass  # Non-critical if caching fails
+        return frame_map
+
+    @staticmethod
+    def load_frames_by_global_indices(
+        global_indices: np.ndarray,
+        frame_map_entries: list[tuple[Path, int, int]],
+        video_backend: str = "decord",
+        video_backend_kwargs: dict | None = None,
+    ) -> np.ndarray:
+        """Load video frames using global frame indices, mapping to the correct video file(s).
+
+        Args:
+            global_indices: Array of global frame indices (from parquet 'index' column).
+            frame_map_entries: List of (file_path, cumulative_start, num_frames) for this camera.
+            video_backend: Video backend to use.
+            video_backend_kwargs: Additional kwargs for video backend.
+
+        Returns:
+            np.ndarray: Frames array of shape (N, H, W, 3).
+        """
+        if video_backend_kwargs is None:
+            video_backend_kwargs = {}
+
+        # Group global indices by video file
+        result_frames = [None] * len(global_indices)
+        result_order = np.argsort(global_indices)
+        sorted_indices = global_indices[result_order]
+
+        file_idx = 0
+        i = 0
+        while i < len(sorted_indices) and file_idx < len(frame_map_entries):
+            file_path, cum_start, num_frames = frame_map_entries[file_idx]
+            cum_end = cum_start + num_frames
+
+            # Collect all indices belonging to this file
+            batch_positions = []
+            batch_local_indices = []
+            while i < len(sorted_indices) and sorted_indices[i] < cum_end:
+                if sorted_indices[i] >= cum_start:
+                    batch_positions.append(result_order[i])
+                    batch_local_indices.append(int(sorted_indices[i] - cum_start))
+                i += 1
+
+            if batch_local_indices:
+                frames = get_frames_by_indices(
+                    str(file_path),
+                    np.array(batch_local_indices),
+                    video_backend=video_backend,
+                    video_backend_kwargs=video_backend_kwargs,
+                )
+                for pos, frame in zip(batch_positions, frames):
+                    result_frames[pos] = frame
+
+            file_idx += 1
+
+        # Stack into array
+        return np.stack(result_frames)
+
     def generate_shards(self) -> tuple[list[list[int]], np.ndarray]:
         """Generate shards of trajectories. We recommend num_steps_per_shard >> average trajectory length.
 
@@ -427,7 +555,7 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
         for trajectory_id in trajectory_ids:
             sharded_trajectories[-1].append(trajectory_id)
             curr_num_steps += len(self.step_filter[trajectory_id])
-            if curr_num_steps > cutoffs[curr_shard_index]:
+            while curr_shard_index < len(cutoffs) and curr_num_steps > cutoffs[curr_shard_index]:
                 sharded_trajectories.append([])
                 curr_shard_index += 1
                 shard_lengths.append(curr_num_steps - last_num_steps)
@@ -454,46 +582,86 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
         video_backend: str = "pyav",
         video_backend_kwargs: dict | None = None,
         fps: float = None,
-    ) -> tuple[dict[str, np.ndarray], dict[int, int], pd.DataFrame]:
-        # Optional logging to avoid stdout overhead during tight loops
-        # (controlled by instance-level verbose flag)
-        # Using a staticmethod, we cannot read self.verbose; defer to caller to control prints
+        max_steps_per_trajectory: int | None = None,
+        video_frame_map: dict[str, list[tuple[Path, int, int]]] | None = None,
+    ) -> tuple[dict[str, np.ndarray], dict[int, int], pd.DataFrame, dict[int, int], dict[int, int], dict[int, int], dict[int, int]]:
         print("Caching shard")
         start_time = time.time()
         assert "video" in modality_keys, "No video modality found. No need to use caching."
         cached_frames = {}
         trajectory_start_indices = {}
+        window_starts: dict[int, int] = {}
+        window_sizes: dict[int, int] = {}
+        df_start_rows: dict[int, int] = {}
+        df_sizes: dict[int, int] = {}
         curr_step_index = 0
-        cached_df = None
+        df_curr_row = 0
+        df_parts = []
+        rng = np.random.default_rng()
+        # Determine if we should use index-based video loading (for DROID multi-episode files)
+        use_index_loading = video_frame_map is not None and len(video_frame_map) > 0
+
         for trajectory_id in trajectory_ids:
-            trajectory_start_indices[trajectory_id] = curr_step_index
-            parquet_path = parquet_paths[trajectory_id]
-            parquet_df = pd.read_parquet(parquet_path)
-            # Check timestamps are in sync
-            parquet_timestamps = parquet_df["timestamp"].to_numpy()
-            trajectory_length = len(parquet_timestamps)
             if isinstance(trajectory_id, np.integer):
                 trajectory_id = trajectory_id.item()
             assert isinstance(
                 trajectory_id, int
             ), f"trajectory_id must be an integer, got {type(trajectory_id)}"
+            trajectory_start_indices[trajectory_id] = curr_step_index
+            parquet_path = parquet_paths[trajectory_id]
+            parquet_df = pd.read_parquet(parquet_path)
+            trajectory_length = len(parquet_df)
+
+            # Track positional row slice in cached_df for this trajectory
+            df_start_rows[trajectory_id] = df_curr_row
+            df_sizes[trajectory_id] = trajectory_length
+            df_curr_row += trajectory_length
+            df_parts.append(parquet_df)
+
+            # Windowed loading: cap video frames to max_steps_per_trajectory
+            if max_steps_per_trajectory is not None and trajectory_length > max_steps_per_trajectory:
+                window_start = int(rng.integers(0, trajectory_length - max_steps_per_trajectory + 1))
+                window_size = max_steps_per_trajectory
+                print(
+                    f"  Windowed trajectory {trajectory_id}: rows={trajectory_length}, "
+                    f"window=[{window_start}, {window_start + window_size}) ({window_size} steps)"
+                )
+            else:
+                window_start = 0
+                window_size = trajectory_length
+
+            window_starts[trajectory_id] = window_start
+            window_sizes[trajectory_id] = window_size
+
             for key in modality_keys["video"]:
                 assert key.startswith("video."), f"Video key must start with 'video.', got {key}"
                 if key not in cached_frames:
                     cached_frames[key] = []
-                frames = get_frames_by_timestamps(
-                    video_paths[trajectory_id][key].as_posix(),
-                    timestamps=parquet_timestamps,
-                    video_backend=video_backend,
-                    video_backend_kwargs=video_backend_kwargs,
-                    fps=fps,
-                )
+
+                if use_index_loading and key in video_frame_map:
+                    # Use global frame indices from parquet 'index' column
+                    global_indices = parquet_df["index"].to_numpy()[window_start : window_start + window_size]
+                    frames = ShardedLeRobotSubLangSingleActionChunkDatasetDROID.load_frames_by_global_indices(
+                        global_indices,
+                        video_frame_map[key],
+                        video_backend=video_backend,
+                        video_backend_kwargs=video_backend_kwargs or {},
+                    )
+                else:
+                    # Fallback: timestamp-based loading (for non-DROID datasets)
+                    parquet_timestamps = parquet_df["timestamp"].to_numpy()
+                    video_timestamps = parquet_timestamps[window_start : window_start + window_size]
+                    frames = get_frames_by_timestamps(
+                        video_paths[trajectory_id][key].as_posix(),
+                        timestamps=video_timestamps,
+                        video_backend=video_backend,
+                        video_backend_kwargs=video_backend_kwargs,
+                        fps=fps,
+                    )
                 cached_frames[key].append(frames)
-            if cached_df is None:
-                cached_df = parquet_df
-            else:
-                cached_df = pd.concat([cached_df, parquet_df])
-            curr_step_index += trajectory_length
+            curr_step_index += window_size
+
+        cached_df = pd.concat(df_parts) if df_parts else None
 
         # Concatenate the frames
         for key in cached_frames:
@@ -505,7 +673,7 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
         if "index" not in cached_df.columns:
             cached_df = cached_df.reset_index(drop=True)
             cached_df["index"] = cached_df.index
-        return cached_frames, trajectory_start_indices, cached_df
+        return cached_frames, trajectory_start_indices, cached_df, window_starts, window_sizes, df_start_rows, df_sizes
 
     def start_cache_shard(self, shard_index: int) -> None:
         """Start caching a shard in a background thread."""
@@ -518,12 +686,22 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
             self.video_backend,
             self.video_backend_kwargs,
             self.fps,
+            self.num_steps_per_shard,
+            self.video_frame_map,
         )
 
     def finish_cache_shard(self):
         """Get the cached shard."""
         assert self._cache_job is not None
-        self.cached_shard, self.shard_start_indices, self.cached_df = self._cache_job.result()
+        (
+            self.cached_shard,
+            self.shard_start_indices,
+            self.cached_df,
+            self.shard_window_starts,
+            self.shard_window_sizes,
+            self.shard_df_start_rows,
+            self.shard_df_sizes,
+        ) = self._cache_job.result()
         self._cache_job = None  # Clear the future to allow memory to be freed
 
     def delete_cached_shard(self):
@@ -531,6 +709,10 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
         del self.cached_shard
         del self.shard_start_indices
         del self.cached_df
+        del self.shard_window_starts
+        del self.shard_window_sizes
+        del self.shard_df_start_rows
+        del self.shard_df_sizes
         # self._traj_cache.clear()
 
     def get_trajectories_in_shard(self) -> list[int]:
@@ -626,26 +808,34 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
                 and self.cached_shard is not None
                 and trajectory_id in self.shard_start_indices
             ), "Shard not cached. Please call `cache_next_shard` and `use_next_shard` first."
-            indices_in_shard = self.shard_start_indices[trajectory_id] + step_indices
+            # Apply window offset: cached_shard only holds [window_start, window_start+window_size)
+            window_start = self.shard_window_starts[trajectory_id] if self.shard_window_starts is not None else 0
+            window_size = self.shard_window_sizes[trajectory_id] if self.shard_window_sizes is not None else trajectory_length
+            window_relative = np.clip(step_indices - window_start, 0, window_size - 1)
+            indices_in_shard = self.shard_start_indices[trajectory_id] + window_relative
             return self.cached_shard[key][indices_in_shard]
-        
+
         # Find language-consistent ranges and uniformly sample from them
         sampled_indices = self._uniform_sample_from_language_ranges(
             step_indices, language_annotations, trajectory_length
         )
-        
+
         # Ensure the sampled indices are within the valid range
         sampled_indices = np.maximum(sampled_indices, 0)
         sampled_indices = np.minimum(sampled_indices, trajectory_length - 1)
         # print("sampled indices", sampled_indices)
-        
+
         # Calculate the absolute indices
         assert (
             self.shard_start_indices is not None
             and self.cached_shard is not None
             and trajectory_id in self.shard_start_indices
         ), "Shard not cached. Please call `cache_next_shard` and `use_next_shard` first."
-        indices_in_shard = self.shard_start_indices[trajectory_id] + sampled_indices
+        # Apply window offset: cached_shard only holds [window_start, window_start+window_size)
+        window_start = self.shard_window_starts[trajectory_id] if self.shard_window_starts is not None else 0
+        window_size = self.shard_window_sizes[trajectory_id] if self.shard_window_sizes is not None else trajectory_length
+        window_relative = np.clip(sampled_indices - window_start, 0, window_size - 1)
+        indices_in_shard = self.shard_start_indices[trajectory_id] + window_relative
         return self.cached_shard[key][indices_in_shard]
 
     def get_data_by_modality(
@@ -1238,39 +1428,28 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
 
 
     def get_trajectory_data(self, trajectory_id: int) -> pd.DataFrame:
-        """Get the trajectory data."""
+        """Get the trajectory data using positional row slicing (not episode_index filtering).
+
+        In DROID-format datasets, trajectory_id is the parquet FILE index, which does NOT
+        correspond to the episode_index column values inside the parquet. We use precomputed
+        row positions (shard_df_start_rows / shard_df_sizes) to extract the correct rows.
+        """
         assert self.cached_df is not None, "Cached dataframe is None"
+        assert self.shard_df_start_rows is not None, "Shard df row positions not set"
+        assert trajectory_id in self.shard_df_start_rows, (
+            f"trajectory_id {trajectory_id} not in shard_df_start_rows. "
+            f"Available: {sorted(self.shard_df_start_rows.keys())}"
+        )
 
-            # Quick verification
-        if self.cached_df.empty:
-            raise ValueError("cached_df is completely empty!")
+        start_row = self.shard_df_start_rows[trajectory_id]
+        size = self.shard_df_sizes[trajectory_id]
+        traj_data = self.cached_df.iloc[start_row : start_row + size]
 
-        # # Fast path: return cached slice if available
-        # if trajectory_id in self._traj_cache:
-        #     return self._traj_cache[trajectory_id]
-
-        available_episodes = self.cached_df["episode_index"].unique()
-        if trajectory_id not in available_episodes:
-            raise ValueError(
-                f"trajectory_id {trajectory_id} not found in cached_df. "
-                f"Available episodes: {sorted(available_episodes)}"
-            )
-
-        traj_data = self.cached_df.loc[self.cached_df["episode_index"] == trajectory_id]
         trajectory_index = self.get_trajectory_index(trajectory_id)
         trajectory_length = self.trajectory_lengths[trajectory_index]
         assert (
             len(traj_data) == trajectory_length
         ), f"Trajectory length mismatch: {len(traj_data)} != {trajectory_length} {self.args} {self.kwargs}"
-        indices = traj_data["index"].to_numpy()
-        if len(indices) > 0:
-            start_index = indices[0]
-            expected_indices = np.arange(start_index, start_index + len(indices))
-            assert np.array_equal(
-                indices, expected_indices
-            ), f"[{self}] Index sequence mismatch in trajectory data, {trajectory_id=}"
-        # Store in cache to avoid repeated filtering on subsequent calls within a batch
-        # self._traj_cache[trajectory_id] = traj_data
         return traj_data
 
 
@@ -1499,6 +1678,21 @@ class ShardedLeRobotMixtureDataset(LeRobotMixtureDataset, IterableDataset):
                 allowed_indices = dataset.step_filter[trajectory_id]
                 # Remove indices that are too large
                 allowed_indices = allowed_indices[allowed_indices <= allowed_length]
+                # Restrict to loaded window if windowed loading is active
+                if (
+                    dataset.shard_window_starts is not None
+                    and trajectory_id in dataset.shard_window_starts
+                ):
+                    w_start = dataset.shard_window_starts[trajectory_id]
+                    w_size = dataset.shard_window_sizes[trajectory_id]
+                    # Leave room for delta_indices so video frames don't get
+                    # clipped at the window boundary while state/action data
+                    # extends beyond it.
+                    max_delta = dataset.max_delta_index if not self.allow_padding_at_end else 0
+                    w_end = w_start + w_size - max_delta
+                    allowed_indices = allowed_indices[
+                        (allowed_indices >= w_start) & (allowed_indices < w_end)
+                    ]
                 for i in allowed_indices:
                     all_steps.append((trajectory_id, i))
             if self.training:

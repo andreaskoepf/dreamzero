@@ -62,7 +62,7 @@ VALID_EMBODIMENT_TAGS = [
     "real_panda_single_arm", "hot3d_hands_only",
     "gr1_unified", "robocasa_gr1_arms_waist_fourier_hands",
     "agibot", "lapa", "oxe_mutex", "oxe_roboset", "oxe_plex",
-    "dream", "yam", "xdof",
+    "dream", "yam", "xdof", "dk1",
     "gr1_unified_segmentation", "language_table_sim", "gr1_isaac",
     "sim_behavior_r1_pro", "mecka_hands", "real_r1_pro_sharpa",
 ]
@@ -85,12 +85,33 @@ def get_parquet_paths(dataset_path: Path, info: dict) -> list[Path]:
     pattern = info.get("data_path", "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet")
     total_episodes = info["total_episodes"]
     chunks_size = info.get("chunks_size", 1000)
+
+    # v3 datasets use file-based naming: data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet
+    # Try the pattern from info.json first, then fall back to glob discovery.
+    is_v3_file_pattern = "file_index" in pattern or "chunk_index" in pattern
+
+    if is_v3_file_pattern:
+        # v3: discover all parquet files from data/ directory since file_index != episode_index
+        data_dir = dataset_path / "data"
+        if data_dir.exists():
+            paths = sorted(data_dir.rglob("*.parquet"))
+            if paths:
+                return paths
+
+    # v2 style: enumerate by episode index
     paths = []
     for ep_idx in range(total_episodes):
         chunk_idx = ep_idx // chunks_size
         p = dataset_path / pattern.format(episode_chunk=chunk_idx, episode_index=ep_idx)
         if p.exists():
             paths.append(p)
+
+    # Fallback: glob if no files found with pattern
+    if not paths:
+        data_dir = dataset_path / "data"
+        if data_dir.exists():
+            paths = sorted(data_dir.rglob("*.parquet"))
+
     return sorted(paths)
 
 
@@ -108,6 +129,18 @@ def detect_features(info: dict) -> dict:
         "annotation": annotation_keys,
         "features": features,
     }
+
+
+def load_task_lookup(dataset_path: Path) -> dict[int, str]:
+    """Load task_index -> task_string mapping from meta/tasks.parquet (LeRobot v3)."""
+    tasks_path = dataset_path / "meta" / "tasks.parquet"
+    if not tasks_path.exists():
+        return {}
+    df = pd.read_parquet(tasks_path)
+    # v3: task string is stored in the DataFrame index, not a column
+    df = df.reset_index()
+    task_col = "task" if "task" in df.columns else df.columns[0]
+    return {i: str(row[task_col]) for i, row in df.iterrows()}
 
 
 def parse_key_mapping(raw: str | None) -> dict[str, list[int]] | None:
@@ -282,27 +315,34 @@ def compute_relative_stats(
             if action_col not in df.columns or state_col not in df.columns:
                 continue
 
-            action_data = np.stack(df[action_col].values).astype(np.float64)
-            state_data = np.stack(df[state_col].values).astype(np.float64)
-            if action_data.ndim == 1:
-                action_data = action_data.reshape(-1, 1)
-            if state_data.ndim == 1:
-                state_data = state_data.reshape(-1, 1)
+            # Group by episode to avoid computing relative actions across episode boundaries
+            if "episode_index" in df.columns:
+                groups = df.groupby("episode_index")
+            else:
+                groups = [(0, df)]
 
-            a_start, a_end = action_meta["start"], action_meta["end"]
-            s_start, s_end = state_meta["start"], state_meta["end"]
+            for _, ep_df in groups:
+                action_data = np.stack(ep_df[action_col].values).astype(np.float64)
+                state_data = np.stack(ep_df[state_col].values).astype(np.float64)
+                if action_data.ndim == 1:
+                    action_data = action_data.reshape(-1, 1)
+                if state_data.ndim == 1:
+                    state_data = state_data.reshape(-1, 1)
 
-            action_slice = action_data[:, a_start:a_end]
-            state_slice = state_data[:, s_start:s_end]
+                a_start, a_end = action_meta["start"], action_meta["end"]
+                s_start, s_end = state_meta["start"], state_meta["end"]
 
-            traj_len = len(df)
-            usable = traj_len - action_horizon
-            for i in range(max(usable, 0)):
-                ref_state = state_slice[i]
-                chunk_end = min(i + action_horizon, traj_len)
-                actions = action_slice[i:chunk_end]
-                relative = actions - ref_state
-                all_relative.extend(relative)
+                action_slice = action_data[:, a_start:a_end]
+                state_slice = state_data[:, s_start:s_end]
+
+                traj_len = len(ep_df)
+                usable = traj_len - action_horizon
+                for i in range(max(usable, 0)):
+                    ref_state = state_slice[i]
+                    chunk_end = min(i + action_horizon, traj_len)
+                    actions = action_slice[i:chunk_end]
+                    relative = actions - ref_state
+                    all_relative.extend(relative)
 
         if not all_relative:
             log.warning("No relative actions computed for '%s'", rel_key)
@@ -325,8 +365,23 @@ def compute_relative_stats(
 # Tasks & episodes
 # ---------------------------------------------------------------------------
 
-def build_tasks(parquet_paths: list[Path], task_key: str | None) -> list[dict]:
-    """Build tasks.jsonl entries from the dataset."""
+def build_tasks(
+    parquet_paths: list[Path],
+    task_key: str | None,
+    task_lookup: dict[int, str] | None = None,
+) -> list[dict]:
+    """Build tasks.jsonl entries from the dataset.
+
+    For LeRobot v3 datasets, episode parquets only have ``task_index`` (int).
+    The actual task strings come from *task_lookup* (loaded from meta/tasks.parquet).
+    """
+    # If we have a task_lookup from meta/tasks.parquet, use it directly
+    if task_lookup:
+        return [
+            {"task_index": idx, "task": text}
+            for idx, text in sorted(task_lookup.items())
+        ]
+
     if task_key is None:
         return [{"task_index": 0, "task": ""}]
 
@@ -346,31 +401,58 @@ def build_tasks(parquet_paths: list[Path], task_key: str | None) -> list[dict]:
     return [{"task_index": idx, "task": text} for text, idx in sorted(task_set.items(), key=lambda x: x[1])]
 
 
-def build_episodes(parquet_paths: list[Path], info: dict, task_key: str | None, tasks: list[dict]) -> list[dict]:
-    """Build episodes.jsonl entries."""
+def build_episodes(
+    parquet_paths: list[Path],
+    info: dict,
+    task_key: str | None,
+    tasks: list[dict],
+    task_lookup: dict[int, str] | None = None,
+) -> list[dict]:
+    """Build episodes.jsonl entries.
+
+    For v3 datasets, resolves ``task_index`` in parquets via *task_lookup*.
+    Handles parquet files that contain multiple episodes (e.g. merged datasets).
+    """
     task_text_to_idx = {t["task"]: t["task_index"] for t in tasks}
-    episodes = []
-    for ep_idx, pp in enumerate(tqdm(parquet_paths, desc="Building episodes")):
+    episodes_map: dict[int, dict] = {}  # episode_index -> episode dict
+
+    for pp in tqdm(parquet_paths, desc="Building episodes"):
         df = pd.read_parquet(pp)
-        length = len(df)
 
-        ep_tasks: list[str] = []
-        if task_key and task_key in df.columns:
-            unique_tasks = df[task_key].unique()
-            for t in unique_tasks:
-                text = str(t) if not isinstance(t, str) else t
-                if text and text in task_text_to_idx:
-                    ep_tasks.append(text)
-        if not ep_tasks:
-            ep_tasks = [""]
+        # Group by episode_index if the column exists and has multiple values
+        if "episode_index" in df.columns:
+            grouped = df.groupby("episode_index")
+        else:
+            # Single-episode file: use running counter as episode index
+            ep_idx = len(episodes_map)
+            grouped = [(ep_idx, df)]
 
-        episodes.append({
-            "episode_index": ep_idx,
-            "tasks": ep_tasks,
-            "length": length,
-        })
+        for ep_idx, ep_df in grouped:
+            ep_idx = int(ep_idx)
+            length = len(ep_df)
 
-    return episodes
+            ep_tasks: list[str] = []
+            if task_key and task_key in ep_df.columns:
+                unique_tasks = ep_df[task_key].unique()
+                for t in unique_tasks:
+                    text = str(t) if not isinstance(t, str) else t
+                    if text and text in task_text_to_idx:
+                        ep_tasks.append(text)
+            elif task_lookup and "task_index" in ep_df.columns:
+                for tidx in ep_df["task_index"].unique():
+                    text = task_lookup.get(int(tidx), "")
+                    if text and text in task_text_to_idx:
+                        ep_tasks.append(text)
+            if not ep_tasks:
+                ep_tasks = [""]
+
+            episodes_map[ep_idx] = {
+                "episode_index": ep_idx,
+                "tasks": ep_tasks,
+                "length": length,
+            }
+
+    return [episodes_map[k] for k in sorted(episodes_map.keys())]
 
 
 # ---------------------------------------------------------------------------
@@ -438,6 +520,12 @@ def main():
              "Each key must also exist in --state-keys. If omitted, skips relative stats."
     )
     parser.add_argument("--task-key", type=str, default=None, help="Column name for language annotations (auto-detected if not set)")
+    parser.add_argument(
+        "--video-key-remap", type=str, default=None,
+        help='JSON mapping to rename video short-keys in modality.json, '
+             'e.g. \'{"context": "top", "base_0": "top"}\'. '
+             'The original_key is preserved for file path resolution.'
+    )
     parser.add_argument("--fps", type=float, default=None, help="Override FPS (default: use dataset FPS from info.json)")
     parser.add_argument("--action-horizon", type=int, default=24, help="Action horizon for relative stats (default: 24)")
     parser.add_argument("--force", action="store_true", help="Overwrite existing GEAR metadata files")
@@ -498,6 +586,11 @@ def main():
     state_mapping = parse_key_mapping(args.state_keys)
     action_mapping = parse_key_mapping(args.action_keys)
 
+    # Load v3 task lookup from meta/tasks.parquet (if present)
+    task_lookup = load_task_lookup(dataset_path)
+    if task_lookup:
+        log.info("  Loaded %d tasks from meta/tasks.parquet (LeRobot v3)", len(task_lookup))
+
     # Auto-detect task key if not provided
     task_key = args.task_key
     if task_key is None and detected["annotation"]:
@@ -509,8 +602,29 @@ def main():
             task_key = detected["annotation"][0]
         log.info("  Auto-detected task key: %s", task_key)
 
+    # For v3 datasets without annotation columns, set a virtual task_key for modality.json
+    if task_key is None and task_lookup:
+        task_key = "annotation.task"
+        log.info("  Using virtual task key '%s' (tasks from meta/tasks.parquet)", task_key)
+
     # 2. Build modality.json
     modality = build_modality_json(info, detected, state_mapping, action_mapping, task_key)
+
+    # Apply video key remap if provided
+    video_remap = None
+    if args.video_key_remap:
+        try:
+            video_remap = json.loads(args.video_key_remap)
+        except json.JSONDecodeError as e:
+            log.error("Invalid JSON for video-key-remap: %s", e)
+            sys.exit(1)
+    if video_remap:
+        new_video = {}
+        for short_name, entry in modality["video"].items():
+            mapped_name = video_remap.get(short_name, short_name)
+            new_video[mapped_name] = entry
+        modality["video"] = new_video
+        log.info("  Remapped video keys: %s", video_remap)
 
     modality_path = meta_dir / "modality.json"
     if modality_path.exists() and not args.force:
@@ -578,7 +692,7 @@ def main():
     if tasks_path.exists() and not args.force:
         log.info("  tasks.jsonl already exists, skipping")
     else:
-        tasks = build_tasks(parquet_paths, task_key)
+        tasks = build_tasks(parquet_paths, task_key, task_lookup=task_lookup)
         with open(tasks_path, "w") as f:
             for t in tasks:
                 f.write(json.dumps(t) + "\n")
@@ -596,7 +710,7 @@ def main():
                     tasks.append(json.loads(line.strip()))
         if not tasks:
             tasks = [{"task_index": 0, "task": ""}]
-        episodes = build_episodes(parquet_paths, info, task_key, tasks)
+        episodes = build_episodes(parquet_paths, info, task_key, tasks, task_lookup=task_lookup)
         with open(episodes_path, "w") as f:
             for ep in episodes:
                 f.write(json.dumps(ep) + "\n")

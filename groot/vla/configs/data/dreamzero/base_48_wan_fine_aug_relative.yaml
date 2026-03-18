@@ -342,6 +342,97 @@ transform_yam:
     - ${model_specific_transform}
 
 ################################################################################
+# dk1 (DK-1 bimanual: state 14, action 14, 3 views: overview + 2 wrists)
+# Camera key names vary by dataset author (top/context/base_0 for overview)
+# but modality.json maps them all to: top, left_wrist, right_wrist
+################################################################################
+
+modality_config_dk1:
+  video:
+    _target_: groot.vla.data.dataset.ModalityConfig
+    delta_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
+    eval_delta_indices: [0]
+    modality_keys:
+      - video.top
+      - video.left_wrist
+      - video.right_wrist
+  state:
+    _target_: groot.vla.data.dataset.ModalityConfig
+    delta_indices: [0]
+    modality_keys:
+      - state.left_joint_pos
+      - state.left_gripper_pos
+      - state.right_joint_pos
+      - state.right_gripper_pos
+  action:
+    _target_: groot.vla.data.dataset.ModalityConfig
+    delta_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+    modality_keys:
+      - action.left_joint_pos
+      - action.left_gripper_pos
+      - action.right_joint_pos
+      - action.right_gripper_pos
+  language:
+    _target_: groot.vla.data.dataset.ModalityConfig
+    delta_indices: [0]
+    modality_keys:
+      - annotation.task
+
+transform_dk1:
+  _target_: groot.vla.data.transform.ComposedModalityTransform
+  transforms:
+    # Video transforms
+    - <<: *totensor_cfg
+      apply_to: ${modality_config_dk1.video.modality_keys}
+    # Per-view resolution normalization: cameras have different native
+    # resolutions (800x600, 960x540, 640x480, 640x360, 1280x720).
+    # Each view is independently resize-smallest-side + center-cropped
+    # to this common resolution before the shared crop/resize pipeline.
+    - _target_: groot.vla.data.transform.VideoResolutionNormalize
+      apply_to: ${modality_config_dk1.video.modality_keys}
+      target_width: 640
+      target_height: 360
+    - <<: *crop_cfg
+      apply_to: ${modality_config_dk1.video.modality_keys}
+    - <<: *resize_cfg
+      apply_to: ${modality_config_dk1.video.modality_keys}
+    - <<: *color_jitter_cfg
+      apply_to: ${modality_config_dk1.video.modality_keys}
+    - <<: *to_numpy_cfg
+      apply_to: ${modality_config_dk1.video.modality_keys}
+
+    # State transforms
+    - _target_: groot.vla.data.transform.StateActionToTensor
+      apply_to: ${modality_config_dk1.state.modality_keys}
+    - _target_: groot.vla.data.transform.StateActionTransform
+      apply_to: ${modality_config_dk1.state.modality_keys}
+      normalization_modes:
+        state.left_joint_pos: q99
+        state.left_gripper_pos: q99
+        state.right_joint_pos: q99
+        state.right_gripper_pos: q99
+
+    # Action transforms
+    - _target_: groot.vla.data.transform.StateActionToTensor
+      apply_to: ${modality_config_dk1.action.modality_keys}
+    - _target_: groot.vla.data.transform.StateActionTransform
+      apply_to: ${modality_config_dk1.action.modality_keys}
+      normalization_modes:
+        action.left_joint_pos: q99
+        action.left_gripper_pos: q99
+        action.right_joint_pos: q99
+        action.right_gripper_pos: q99
+
+    # ConcatTransform
+    - _target_: groot.vla.data.transform.ConcatTransform
+      video_concat_order: ${modality_config_dk1.video.modality_keys}
+      state_concat_order: ${modality_config_dk1.state.modality_keys}
+      action_concat_order: ${modality_config_dk1.action.modality_keys}
+
+    # Model-specific transform
+    - ${model_specific_transform}
+
+################################################################################
 # Modality Configs
 ################################################################################
 
@@ -349,6 +440,7 @@ modality_configs:
   oxe_droid: ${modality_config_oxe_droid}
   agibot: ${modality_config_agibot}
   yam: ${modality_config_yam}
+  dk1: ${modality_config_dk1}
 
 ################################################################################
 # Transforms
@@ -358,6 +450,7 @@ transforms:
   oxe_droid: ${transform_oxe_droid}
   agibot: ${transform_agibot}
   yam: ${transform_yam}
+  dk1: ${transform_dk1}
 
 ################################################################################
 # Metadata Versions
@@ -367,6 +460,7 @@ metadata_versions:
   oxe_droid: '0221'
   agibot: '0221'
   yam: '0221'
+  dk1: '0221'
 
 ################################################################################
 # FPS (per embodiment, null means use dataset default)
@@ -374,3 +468,4 @@ metadata_versions:
 
 fps:
   yam: 30
+  dk1: 30

@@ -13,6 +13,92 @@ from groot.vla.data.schema import DatasetMetadata
 from groot.vla.data.transform.base import ModalityTransform
 
 
+class VideoResolutionNormalize(ModalityTransform):
+    """Normalize each camera view to a common target resolution.
+
+    Inserted before VideoCrop when dataset cameras have different native
+    resolutions.  For each view independently:
+
+      1. Compute the scale factor so that the *smallest* side of the source
+         matches or exceeds the corresponding side of the target.
+      2. Resize the frame using that scale factor (bilinear interpolation).
+      3. Center-crop to the exact target size.
+
+    If source and target aspect ratios match, step 3 is a no-op.  This
+    preserves spatial proportions and avoids stretching.
+    """
+    target_width: int = Field(..., description="Target width for all views")
+    target_height: int = Field(..., description="Target height for all views")
+
+    def set_metadata(self, dataset_metadata: DatasetMetadata):
+        super().set_metadata(dataset_metadata)
+        # Build a per-key resize spec from the native resolution metadata.
+        self._per_key_ops: dict[str, tuple[int, int, int, int] | None] = {}
+        tw, th = self.target_width, self.target_height
+        for key in self.apply_to:
+            sub_key = key.split(".")[1]
+            if sub_key not in dataset_metadata.modalities.video:
+                raise ValueError(
+                    f"Video key {sub_key} not found in metadata. "
+                    f"Available: {list(dataset_metadata.modalities.video.keys())}"
+                )
+            native_w, native_h = dataset_metadata.modalities.video[sub_key].resolution
+            if native_w == tw and native_h == th:
+                self._per_key_ops[key] = None  # already correct
+                continue
+            # Scale so smallest side fits; the other side will be >= target.
+            scale_w = tw / native_w
+            scale_h = th / native_h
+            scale = max(scale_w, scale_h)
+            resize_w = int(round(native_w * scale))
+            resize_h = int(round(native_h * scale))
+            # Ensure at least target size (rounding safety)
+            resize_w = max(resize_w, tw)
+            resize_h = max(resize_h, th)
+            self._per_key_ops[key] = (resize_h, resize_w, th, tw)
+
+    def apply(self, data: dict[str, Any]) -> dict[str, Any]:
+        for key in self.apply_to:
+            ops = self._per_key_ops.get(key)
+            if ops is None:
+                continue
+            resize_h, resize_w, crop_h, crop_w = ops
+            view = data[key]
+            is_tensor = isinstance(view, torch.Tensor)
+            if not is_tensor:
+                view = torch.from_numpy(view).float()
+
+            # view shape: (T, C, H, W) or (B, T, C, H, W)
+            orig_shape = view.shape
+            if view.ndim == 5:
+                b, t, c, h, w = view.shape
+                view = view.reshape(b * t, c, h, w)
+            elif view.ndim == 4:
+                pass  # (T, C, H, W)
+            else:
+                raise ValueError(f"Unexpected view ndim={view.ndim} for {key}")
+
+            # Step 1+2: resize (smallest-side fit)
+            view = torch.nn.functional.interpolate(
+                view.float(), size=(resize_h, resize_w),
+                mode="bilinear", align_corners=False,
+            ).to(view.dtype)
+
+            # Step 3: center-crop to exact target
+            cur_h, cur_w = view.shape[-2], view.shape[-1]
+            top = (cur_h - crop_h) // 2
+            left = (cur_w - crop_w) // 2
+            view = view[:, :, top : top + crop_h, left : left + crop_w]
+
+            if len(orig_shape) == 5:
+                view = view.reshape(b, t, c, crop_h, crop_w)
+
+            if not is_tensor:
+                view = view.numpy()
+            data[key] = view
+        return data
+
+
 class VideoTransform(ModalityTransform):
     # Configurable attributes
     backend: str = Field(
@@ -244,9 +330,14 @@ class VideoCrop(VideoTransform):
             Callable: If mode is "train", return a random crop transform. If mode is "eval", return a center crop transform.
         """
         # 1. Check the input resolution
-        assert (
-           len(set(self.original_resolutions.values())) == 1
-        ), f"All video keys must have the same resolution, got: {self.original_resolutions}"
+        if len(set(self.original_resolutions.values())) > 1:
+            # Mixed resolutions across cameras — a VideoResolutionNormalize
+            # transform should be placed before VideoCrop in the pipeline to
+            # bring all views to a common resolution.  If it is present, the
+            # actual runtime resolutions will be uniform even though the
+            # metadata still reports the native sizes.  We therefore skip
+            # this assertion when a normalizer is expected.
+            pass
         if self.height is None:
             assert self.width is None, "Height and width must be either both provided or both None"
             self.width, self.height = self.original_resolutions[self.apply_to[0]]

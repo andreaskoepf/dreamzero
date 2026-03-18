@@ -346,3 +346,8 @@ class EmbodimentTag(Enum):
     """
     The Mecka robot with hands.
     """
+
+    DK1 = "dk1"
+    """
+    The DK-1 bimanual desktop arm (14-DoF: 2x6 joints + 2 grippers).
+    """

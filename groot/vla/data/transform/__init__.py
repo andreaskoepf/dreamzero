@@ -22,6 +22,7 @@ from .video import (
     VideoRandomPosterize,
     VideoRandomRotation,
     VideoResize,
+    VideoResolutionNormalize,
     VideoToNumpy,
     VideoToTensor,
     VideoTransform,

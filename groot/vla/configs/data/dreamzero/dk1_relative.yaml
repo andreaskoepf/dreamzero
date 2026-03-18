@@ -1,0 +1,88 @@
+# @package _global_
+
+defaults:
+  - dreamzero/base_48_wan_fine_aug_relative
+  - _self_ # this file will override the base
+
+max_state_dim: 64
+use_global_metadata: false
+relative_action: true
+relative_action_per_horizon: false
+relative_action_keys:
+  - left_joint_pos
+  - left_gripper_pos
+  - right_joint_pos
+  - right_gripper_pos
+max_chunk_size: 5
+# Use 10% of data in shards before moving to next shard
+dataset_shard_sampling_rate: 0.1
+mixture_dataset_cls: groot.vla.data.dataset.lerobot_sharded.ShardedLeRobotMixtureDataset.from_mixture_spec
+single_dataset_cls: groot.vla.data.dataset.lerobot_sharded.ShardedLeRobotSubLangSingleActionChunkDatasetDROID
+
+# Base path containing all DK-1 subdatasets
+dk1_data_root: ???
+
+train_dataset:
+  _target_: ${mixture_dataset_cls}
+  _convert_: object
+  mixture_spec:
+    - dataset_path:
+        dk1:
+          - ${dk1_data_root}/FabianKerj_dualarm-pretrain-127ep
+          # FabianKerj_dualarm-pretrain-417ep excluded: episodes.jsonl has 2 entries but only 1 parquet file exists (file-001.parquet missing)
+          - ${dk1_data_root}/Gongsta_dk1_2026-02-28
+          - ${dk1_data_root}/Gongsta_dk1_2026-03-01
+          - ${dk1_data_root}/Gongsta_dk1_2026-03-02
+          - ${dk1_data_root}/Gongsta_dk1_2026-03-03
+          - ${dk1_data_root}/Gongsta_trlc_tshirt_folding
+          - ${dk1_data_root}/Zasha01_cube_transfer_final
+          - ${dk1_data_root}/Zasha01_eval_pi05-cube-transfer-final-full15
+          - ${dk1_data_root}/Zasha01_eval_pi05-cube-transfer_v1
+          - ${dk1_data_root}/Zasha01_lego_cube
+          - ${dk1_data_root}/Zasha01_lego_cube_final
+          - ${dk1_data_root}/Zasha01_packaging
+          - ${dk1_data_root}/Zasha01_test_tube_insertion6
+          - ${dk1_data_root}/Zasha01_test_tube_insertion7
+          - ${dk1_data_root}/Zasha01_towel_folding
+          - ${dk1_data_root}/Zasha01_video4
+          - ${dk1_data_root}/dopaul_pcb_placement_100x_1st_item
+          - ${dk1_data_root}/dopaul_pcb_placement_v1
+          - ${dk1_data_root}/qualiaadmin_eventgrab11
+          - ${dk1_data_root}/qualiaadmin_mandminbox
+          - ${dk1_data_root}/qualiaadmin_pingpongmegamerge
+          - ${dk1_data_root}/qualiaadmin_pingpongred1
+          - ${dk1_data_root}/qualiaadmin_pinkthing_reward1_10
+          - ${dk1_data_root}/qualiaadmin_pinkthing_reward1_20
+          - ${dk1_data_root}/qualiaadmin_plasticcuprepeat1
+          - ${dk1_data_root}/qualiaadmin_plasticinbox50episodesimpedance
+          - ${dk1_data_root}/qualiaadmin_spoon1
+          - ${dk1_data_root}/qualiaadmin_spoon10
+      dataset_weight: 1.0
+      distribute_weights: true
+
+  dataset_class: ${single_dataset_cls}
+  all_modality_configs: ${modality_configs}
+  all_transforms: ${transforms}
+  metadata_versions: ${metadata_versions}
+  fps: ${fps}
+  dataset_kwargs:
+    video_backend: decord
+    use_global_metadata: ${use_global_metadata}
+    max_chunk_size: ${max_chunk_size}
+    relative_action: ${relative_action}
+    relative_action_keys: ${relative_action_keys}
+    relative_action_per_horizon: ${relative_action_per_horizon}
+    relative_stats_path: ${dk1_data_root}/global_relative_stats_dreamzero.json
+    # Limit shard cache size to reduce peak RAM usage.
+    # Windowed loading: only num_steps_per_shard contiguous video frames are loaded
+    # per trajectory, regardless of parquet size (fixes OOM for large single-file datasets).
+    # RAM budget: 704 GB max, ~150 GB overhead → 554 GB for video.
+    # num_workers=0 + 4 GPUs → 4 main processes × 2 shards each = 8 concurrent shards.
+    # Per shard budget: 554/8 ≈ 69 GB.
+    # At 10k steps × 3 cams × 640×360 × 3 bytes ≈ 20 GB/shard → 160 GB total — safe.
+    num_steps_per_shard: 10000
+  mixture_kwargs:
+    training: true
+    balance_dataset_weights: false
+    seed: 42
+    shard_sampling_rate: ${dataset_shard_sampling_rate}

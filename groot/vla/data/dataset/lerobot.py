@@ -135,6 +135,7 @@ class LeRobotSingleDataset(Dataset):
         relative_action: bool = False,
         relative_action_keys: list[str] | None = None,
         relative_action_per_horizon: bool = False,
+        relative_stats_path: str | Path | None = None,
     ):
         """
         Initialize the dataset.
@@ -179,6 +180,7 @@ class LeRobotSingleDataset(Dataset):
         else:
             # Default: apply to all action keys except those containing 'gripper'
             self.relative_action_keys = None  # Will be set after modality_configs is available
+        self._relative_stats_path = Path(relative_stats_path) if relative_stats_path is not None else None
         self._relative_action_keys_input = relative_action_keys  # Store original input
         self._dataset_path = Path(dataset_path)
         self._dataset_name = self._dataset_path.name
@@ -463,7 +465,10 @@ class LeRobotSingleDataset(Dataset):
             dict[str, DatasetStatisticalValues]: Dictionary mapping action keys to their relative stats.
         """
         # Determine the path for relative stats file
-        if self.use_global_metadata:
+        if self._relative_stats_path is not None:
+            # Shared stats path provided — all datasets use the same file
+            stats_path = self._relative_stats_path
+        elif self.use_global_metadata:
             assert (
                 self.metadata_version is not None
             ), "metadata_version must be provided if use_global_metadata is True"
@@ -1333,8 +1338,10 @@ class LeRobotSingleDataset(Dataset):
     def get_parquet_path(self, trajectory_id: int) -> Path:
         """Get the parquet path for a trajectory."""
         chunk_index = self.get_episode_chunk(trajectory_id)
+        file_index = trajectory_id % self.chunk_size
         return self.dataset_path / self.data_path_pattern.format(
-            episode_chunk=chunk_index, episode_index=trajectory_id
+            episode_chunk=chunk_index, episode_index=trajectory_id,
+            chunk_index=chunk_index, file_index=file_index,
         )
 
     def get_trajectory_data(self, trajectory_id: int) -> pd.DataFrame:
@@ -1433,8 +1440,10 @@ class LeRobotSingleDataset(Dataset):
         original_key = self.lerobot_modality_meta.video[key].original_key
         if original_key is None:
             original_key = key
+        file_index = trajectory_id % self.chunk_size
         video_filename = self.video_path_pattern.format(
-            episode_chunk=chunk_index, episode_index=trajectory_id, video_key=original_key
+            episode_chunk=chunk_index, episode_index=trajectory_id, video_key=original_key,
+            chunk_index=chunk_index, file_index=file_index,
         )
         return self.dataset_path / video_filename
 
@@ -2457,10 +2466,14 @@ class LeRobotMixtureDataset(Dataset):
                 modality_configs[modality].add(json.dumps(configs))
         merged_metadata["modalities"] = {}
         for modality, configs in modality_configs.items():
-            # Check that all modality configs correspond to the same tag matches
-            assert (
-                len(configs) == 1
-            ), f"Multiple modality configs for modality {modality}: {list(configs)}"
+            if len(configs) > 1 and modality == "video":
+                # Video modality may have mixed native resolutions across datasets;
+                # the transform pipeline (VideoResolutionNormalize) handles normalization.
+                pass
+            else:
+                assert (
+                    len(configs) == 1
+                ), f"Multiple modality configs for modality {modality}: {list(configs)}"
             merged_metadata["modalities"][modality] = json.loads(configs.pop())
 
         return DatasetMetadata.model_validate(merged_metadata)
