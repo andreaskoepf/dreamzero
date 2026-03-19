@@ -56,7 +56,7 @@ torchrun --nproc_per_node $NUM_GPUS --standalone \
     training_args.warmup_ratio=0.05 \
     output_dir=$OUTPUT_DIR \
     per_device_train_batch_size=1 \
-    max_steps=${MAX_STEPS:-10000} \
+    max_steps=${MAX_STEPS:-20000} \
     weight_decay=1e-5 \
     save_total_limit=2 \
     upload_checkpoints=false \
@@ -64,8 +64,8 @@ torchrun --nproc_per_node $NUM_GPUS --standalone \
     tf32=true \
     eval_bf16=true \
     dataloader_pin_memory=false \
-    dataloader_num_workers=${DATALOADER_NUM_WORKERS:-0} \
-    dataloader_persistent_workers=false \
+    dataloader_num_workers=${DATALOADER_NUM_WORKERS:-1} \
+    dataloader_persistent_workers=true \
     image_resolution_width=320 \
     image_resolution_height=176 \
     save_lora_only=true \
