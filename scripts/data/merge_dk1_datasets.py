@@ -235,6 +235,9 @@ def load_source_tasks(ds_path: Path) -> dict[int, str]:
     if tasks_pq.exists():
         df = pd.read_parquet(tasks_pq).reset_index()
         task_col = "task" if "task" in df.columns else df.columns[0]
+        idx_col = "task_index" if "task_index" in df.columns else None
+        if idx_col:
+            return {int(row[idx_col]): str(row[task_col]) for _, row in df.iterrows()}
         return {i: str(row[task_col]) for i, row in df.iterrows()}
 
     # Fall back to tasks.jsonl
@@ -425,17 +428,20 @@ def build_source_video_frame_map(
     """
     import decord
 
-    video_dir = ds_path / "videos" / cam_key / "chunk-000"
-    if not video_dir.exists():
+    cam_dir = ds_path / "videos" / cam_key
+    if not cam_dir.exists():
         return []
 
     entries = []
     cum_start = 0
-    for vf in sorted(video_dir.glob("file-*.mp4")):
-        vr = decord.VideoReader(str(vf))
-        n_frames = len(vr)
-        entries.append((vf, cum_start, n_frames))
-        cum_start += n_frames
+    for chunk_dir in sorted(cam_dir.glob("chunk-*")):
+        if not chunk_dir.is_dir():
+            continue
+        for vf in sorted(chunk_dir.glob("file-*.mp4")):
+            vr = decord.VideoReader(str(vf))
+            n_frames = len(vr)
+            entries.append((vf, cum_start, n_frames))
+            cum_start += n_frames
     return entries
 
 
@@ -946,14 +952,21 @@ def verify_dataset(output_path: Path, total_episodes: int, target_width: int, ta
                     f"got {vinfo['width']}x{vinfo['height']}"
                 )
 
-            # Frame count tolerance +-2
-            if abs(vinfo["nb_frames"] - n_rows) > 2:
+            # Frame count check: exact match expected, tolerance +-1 for
+            # ffprobe reporting quirks with h264 (last frame timing).
+            diff = abs(vinfo["nb_frames"] - n_rows)
+            if diff > 1:
                 frame_count_mismatches += 1
                 if frame_count_mismatches <= 10:
                     errors.append(
                         f"frame count mismatch: ep={ep_idx} cam={cam} "
                         f"video={vinfo['nb_frames']} parquet={n_rows}"
                     )
+            elif diff == 1:
+                log.debug(
+                    "frame count off-by-1: ep=%d cam=%s video=%d parquet=%d",
+                    ep_idx, cam, vinfo["nb_frames"], n_rows,
+                )
 
     if frame_count_mismatches > 10:
         errors.append(f"... and {frame_count_mismatches - 10} more frame count mismatches")
@@ -1092,6 +1105,11 @@ def main():
                     ds["path"], src_cam_key,
                 )
 
+        # Track cumulative row offset across parquet files within this dataset.
+        # This is the correct video frame offset — it counts rows sequentially
+        # rather than relying on the parquet "index" column which may not start at 0.
+        ds_row_offset = 0
+
         for pf in ds["parquet_files"]:
             # Split this parquet into individual episodes
             episodes = split_parquet_by_episode(
@@ -1101,11 +1119,8 @@ def main():
                 task_remap=ds_task_remap,
             )
 
-            # The global row offset for this source file (for mapping to video frames)
-            # is the sum of rows in all prior parquet files for this dataset.
-            # We can compute it from the source parquet's index column.
-            source_df = pd.read_parquet(pf, columns=["index"])
-            file_global_start = int(source_df["index"].iloc[0]) if len(source_df) > 0 else 0
+            # Count total rows in this parquet file for advancing ds_row_offset
+            file_total_rows = sum(len(ep_df) for ep_df, _, _ in episodes)
 
             for ep_df, orig_ep_idx, row_offset_in_file in episodes:
                 n_frames = len(ep_df)
@@ -1144,8 +1159,9 @@ def main():
 
                 # Queue video extraction jobs
                 if not args.skip_videos:
-                    # Global frame start for this episode in the source dataset's video files
-                    video_global_start = file_global_start + row_offset_in_file
+                    # Video frame offset = cumulative rows from prior parquet files
+                    # + row offset of this episode within the current file
+                    video_global_start = ds_row_offset + row_offset_in_file
 
                     for src_cam_key, dst_cam_key in cam_mapping.items():
                         dst_video = (
@@ -1171,6 +1187,8 @@ def main():
                 global_frame_index += n_frames
                 global_episode_index += 1
 
+            ds_row_offset += file_total_rows
+
     total_episodes = global_episode_index
     total_frames = global_frame_index
     log.info("  Wrote %d episode parquets, %d total frames", total_episodes, total_frames)
@@ -1185,22 +1203,33 @@ def main():
         from collections import defaultdict
         batch_jobs: dict[str, list[tuple[int, int, str]]] = defaultdict(list)
 
+        crossfile_jobs = []  # fallback jobs for episodes spanning multiple files
+
         for fm_serialized, video_global_start, n_frames, dst_path, tw, th, fps_val in video_jobs:
-            # Find which source video file contains these frames
+            # Find which source video file(s) contain these frames
+            global_end = video_global_start + n_frames
+            matched = False
             for src_path_str, cum_start, file_nframes in fm_serialized:
                 cum_end = cum_start + file_nframes
                 if video_global_start >= cum_start and video_global_start < cum_end:
                     local_start = video_global_start - cum_start
-                    # Check if episode fits entirely in this file
-                    local_end = local_start + n_frames
-                    if local_end <= file_nframes:
+                    if local_start + n_frames <= file_nframes:
+                        # Episode fits entirely in this file — use batch path
                         batch_jobs[src_path_str].append((local_start, n_frames, dst_path))
                     else:
-                        # Episode spans files — fall back to per-episode extraction
+                        # Episode spans files — queue for sequential extraction
                         log.warning("Episode spans video files at %s frame %d — using fallback", src_path_str, video_global_start)
-                        frame_map = [(Path(p), cs, nf) for p, cs, nf in fm_serialized]
-                        extract_episode_video(frame_map, video_global_start, n_frames, Path(dst_path), tw, th, fps_val)
+                        crossfile_jobs.append((fm_serialized, video_global_start, n_frames, dst_path, tw, th, fps_val))
+                    matched = True
                     break
+
+            if not matched:
+                log.error("No source video found for frame %d in %s", video_global_start, dst_path)
+
+        # Process cross-file episodes sequentially (rare case)
+        for fm_serialized, video_global_start, n_frames, dst_path, tw, th, fps_val in crossfile_jobs:
+            frame_map = [(Path(p), cs, nf) for p, cs, nf in fm_serialized]
+            extract_episode_video(frame_map, video_global_start, n_frames, Path(dst_path), tw, th, fps_val)
 
         total_batch_episodes = sum(len(eps) for eps in batch_jobs.values())
         log.info("  Batch splitting: %d source videos → %d episode videos (%d workers)",
