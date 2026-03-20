@@ -445,11 +445,18 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
             original_key = self.lerobot_modality_meta.video[cam_name].original_key
             if original_key is None:
                 original_key = cam_name
-            video_dir = self.dataset_path / "videos" / original_key / "chunk-000"
-            if not video_dir.exists():
-                print(f"Warning: video dir not found: {video_dir}")
+            video_base_dir = self.dataset_path / "videos" / original_key
+            if not video_base_dir.exists():
+                print(f"Warning: video dir not found: {video_base_dir}")
                 continue
-            video_files = sorted(video_dir.glob("file-*.mp4"))
+            # Scan all chunk directories (chunk-000, chunk-001, ...)
+            chunk_dirs = sorted(video_base_dir.glob("chunk-*"))
+            if not chunk_dirs:
+                print(f"Warning: no chunk dirs in {video_base_dir}")
+                continue
+            video_files = []
+            for chunk_dir in chunk_dirs:
+                video_files.extend(sorted(chunk_dir.glob("file-*.mp4")))
             entries = []
             cache_entries = []
             cum_start = 0
@@ -522,6 +529,18 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
                     result_frames[pos] = frame
 
             file_idx += 1
+
+        # Check for unfilled frames (indicates frame map doesn't cover all indices)
+        missing = [i for i, f in enumerate(result_frames) if f is None]
+        if missing:
+            missing_indices = global_indices[missing[:5]]
+            max_cum = frame_map_entries[-1]["cum_start"] + frame_map_entries[-1]["num_frames"] if isinstance(frame_map_entries[-1], dict) else frame_map_entries[-1][1] + frame_map_entries[-1][2]
+            raise ValueError(
+                f"Failed to load {len(missing)} of {len(global_indices)} frames. "
+                f"First missing global indices: {missing_indices.tolist()}. "
+                f"Frame map covers up to {max_cum}. "
+                f"Frame map has {len(frame_map_entries)} entries."
+            )
 
         # Stack into array
         return np.stack(result_frames)

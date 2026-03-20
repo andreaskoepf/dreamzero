@@ -603,8 +603,6 @@ class WANPolicyHead(ActionHead):
         videos = data["images"]
 
         videos = rearrange(videos, "b t h w c -> b c t h w")
-        print("videos", videos.shape)
-        
 
         if videos.dtype == torch.uint8:
             videos = videos.float() / 255.0
@@ -974,14 +972,9 @@ class WANPolicyHead(ActionHead):
             self.current_start_frame = 0
             self.language = data["text"]
         elif videos.shape[2] == 1:
-            print("videos.shape[2] == 1, reset current_start_frame to 0")
             self.current_start_frame = 0
         elif self.current_start_frame >= self.model.local_attn_size:
-            print("current_start_frame >= local_attn_size, reset current_start_frame to 0")
             self.current_start_frame = 0
-
-        if self.ip_rank == 0:
-            print("videos shape", videos.shape, self.num_frames)
 
         start_text_encoder_event.record()
 
