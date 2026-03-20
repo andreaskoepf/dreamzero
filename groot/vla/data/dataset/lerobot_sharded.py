@@ -106,6 +106,10 @@ class ShardedLeRobotSingleDataset(LeRobotSingleDataset):
         assert (
             len(trajectory_ids) > 0
         ), f"No valid trajectories found for dataset {self.dataset_path}"
+        # Shuffle trajectory order before sharding so each shard contains a
+        # mix of tasks rather than contiguous blocks from the same source.
+        trajectory_ids = list(trajectory_ids)
+        np.random.default_rng(seed=42).shuffle(trajectory_ids)
         total_steps = np.sum(
             [len(self.step_filter[trajectory_id]) for trajectory_id in trajectory_ids]
         ).astype(int)
@@ -545,6 +549,10 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
             ]
 
         assert len(trajectory_ids) > 0, "No valid trajectories found for dataset"
+        # Shuffle trajectory order before sharding so each shard contains a
+        # mix of tasks rather than contiguous blocks from the same source.
+        trajectory_ids = list(trajectory_ids)
+        np.random.default_rng(seed=42).shuffle(trajectory_ids)
         total_steps = np.sum(
             [len(self.step_filter[trajectory_id]) for trajectory_id in trajectory_ids]
         ).astype(int)

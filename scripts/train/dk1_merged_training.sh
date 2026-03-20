@@ -1,11 +1,11 @@
 #!/bin/bash
-# DreamZero DK-1 Training Script (individual subdatasets)
+# DreamZero DK-1 Training Script (merged & deduplicated dataset)
 #
 # Usage:
-#   bash scripts/train/dk1_training.sh
+#   bash scripts/train/dk1_merged_training.sh
 #
 # Prerequisites:
-#   - DK-1 datasets converted to GEAR format at DK1_DATA_ROOT
+#   - Merged DK-1 dataset at DK1_MERGED_DATA_PATH
 #   - Wan2.1-I2V-14B-480P weights at /workspace/checkpoints/Wan2.1-I2V-14B-480P
 #   - umt5-xxl tokenizer at /workspace/checkpoints/umt5-xxl
 #   - DreamZero-AgiBot checkpoint at /home/claude/DreamZero-AgiBot
@@ -13,8 +13,8 @@
 export HYDRA_FULL_ERROR=1
 
 # ============ CHANGE THESE VARIABLES ============
-DK1_DATA_ROOT=${DK1_DATA_ROOT:-"/workspace/data/dk1"}
-OUTPUT_DIR=${OUTPUT_DIR:-"/workspace/checkpoints/dreamzero_dk1_lora"}
+DK1_MERGED_DATA_PATH=${DK1_MERGED_DATA_PATH:-"/workspace/data/dk1-merge-2026-03"}
+OUTPUT_DIR=${OUTPUT_DIR:-"/workspace/checkpoints/dreamzero_dk1_merged_lora"}
 WAN_CKPT_DIR=${WAN_CKPT_DIR:-"/workspace/checkpoints/Wan2.1-I2V-14B-480P"}
 TOKENIZER_DIR=${TOKENIZER_DIR:-"/workspace/checkpoints/umt5-xxl"}
 
@@ -25,7 +25,7 @@ NUM_GPUS=${NUM_GPUS:-4}
 # =============================================
 
 # Validate required paths
-for dir in "$DK1_DATA_ROOT" "$WAN_CKPT_DIR" "$TOKENIZER_DIR"; do
+for dir in "$DK1_MERGED_DATA_PATH" "$WAN_CKPT_DIR" "$TOKENIZER_DIR"; do
     if [ ! -d "$dir" ]; then
         echo "ERROR: Required directory not found: $dir"
         exit 1
@@ -37,8 +37,8 @@ mkdir -p "$OUTPUT_DIR"
 torchrun --nproc_per_node $NUM_GPUS --standalone \
     groot/vla/experiment/experiment.py \
     report_to=wandb \
-    data=dreamzero/dk1_relative \
-    wandb_project=dreamzero-dk1 \
+    data=dreamzero/dk1_merged_relative \
+    wandb_project=dreamzero-dk1-merged \
     train_architecture=lora \
     num_frames=33 \
     action_horizon=24 \
@@ -72,7 +72,7 @@ torchrun --nproc_per_node $NUM_GPUS --standalone \
     max_chunk_size=4 \
     frame_seqlen=880 \
     save_strategy=steps \
-    dk1_data_root=$DK1_DATA_ROOT \
+    dk1_merged_data_path=$DK1_MERGED_DATA_PATH \
     dit_version=$WAN_CKPT_DIR \
     text_encoder_pretrained_path=$WAN_CKPT_DIR/models_t5_umt5-xxl-enc-bf16.pth \
     image_encoder_pretrained_path=$WAN_CKPT_DIR/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth \
