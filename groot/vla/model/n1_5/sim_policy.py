@@ -288,7 +288,8 @@ class GrootSimPolicy(BaseGrootSimPolicy):
             if hasattr(train_cfg, "save_lora_only") and train_cfg.save_lora_only is True:
                 print(f"Loading LoRA weights from pretrained")
                 cls = getattr(importlib.import_module(cls_module), cls_name)
-                model = cls.load_lora(model_path)
+                pretrained_base = getattr(train_cfg, "pretrained_model_path", None)
+                model = cls.load_lora(model_path, pretrained_base_model_path=pretrained_base)
             else:
                 print(f"Loading model from pretrained directly")
                 cls = getattr(importlib.import_module(cls_module), cls_name)

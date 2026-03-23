@@ -336,77 +336,151 @@ class VLA(PreTrainedModel):
 
     @classmethod
     def load_lora(
-        cls, 
-        pretrained_model_name_or_path: str
-    ): 
+        cls,
+        pretrained_model_name_or_path: str,
+        pretrained_base_model_path: str | None = None,
+    ):
         from safetensors.torch import load_file
         import os
         import json
+        import gc
         print("loading lora@@@@@")
 
-        # Check for different checkpoint formats
+        # --- 1. Load LoRA checkpoint weights ---
         safetensors_path = os.path.join(pretrained_model_name_or_path, "model.safetensors")
         safetensors_index_path = os.path.join(pretrained_model_name_or_path, "model.safetensors.index.json")
-        
-        state_dict = {}
+
+        lora_state_dict = {}
         if os.path.exists(safetensors_index_path):
-            # Handle sharded safetensors
-            print(f"Loading sharded safetensors using index: {safetensors_index_path}")
-            
+            print(f"Loading sharded LoRA safetensors using index: {safetensors_index_path}")
             with open(safetensors_index_path, 'r') as f:
                 index = json.load(f)
-            
-            # Load each shard
             for shard_file in set(index["weight_map"].values()):
                 shard_path = os.path.join(pretrained_model_name_or_path, shard_file)
                 print(f"Loading shard: {shard_path}")
                 shard_state_dict = load_file(shard_path)
-                state_dict.update(shard_state_dict)
-                
+                lora_state_dict.update(shard_state_dict)
         elif os.path.exists(safetensors_path):
-            # Handle single safetensors file
-            print(f"Loading weights from safetensors: {safetensors_path}")
-            state_dict.update(load_file(safetensors_path))
-        
-        # Load config
+            print(f"Loading LoRA weights from safetensors: {safetensors_path}")
+            lora_state_dict.update(load_file(safetensors_path))
+
+        # --- 2. Resolve pretrained base model path ---
+        # During training, the full base model (e.g. DreamZero-AgiBot) is loaded first,
+        # then LoRA adapters are injected on top. The LoRA checkpoint only stores the
+        # adapter weights + trainable params (action encoder/decoder). We must load the
+        # same base model weights before applying LoRA to match training.
+        if pretrained_base_model_path is None:
+            # Try to read from experiment config
+            exp_cfg_path = os.path.join(pretrained_model_name_or_path, "experiment_cfg", "conf.yaml")
+            if os.path.exists(exp_cfg_path):
+                from omegaconf import OmegaConf
+                exp_cfg = OmegaConf.load(exp_cfg_path)
+                pretrained_base_model_path = getattr(exp_cfg, "pretrained_model_path", None)
+                if pretrained_base_model_path:
+                    print(f"Found pretrained_model_path in experiment config: {pretrained_base_model_path}")
+
+        # Resolve path: if the original training path doesn't exist, try to find the
+        # base model by name in common checkpoint locations
+        if pretrained_base_model_path and not os.path.isdir(pretrained_base_model_path):
+            base_name = os.path.basename(pretrained_base_model_path)
+            search_dirs = [
+                os.path.join(os.path.dirname(pretrained_model_name_or_path), base_name),
+                os.path.join("/workspace/checkpoints", base_name),
+                os.path.join(os.path.expanduser("~"), base_name),
+            ]
+            for candidate in search_dirs:
+                if os.path.isdir(candidate):
+                    print(f"Resolved base model path: {pretrained_base_model_path} -> {candidate}")
+                    pretrained_base_model_path = candidate
+                    break
+
+        # --- 3. Load model config and create model ---
         print("loading config@@")
         config_path = os.path.join(pretrained_model_name_or_path, "config.json")
         with open(config_path, "r") as f:
             config_dict = json.load(f)
         config = VLAConfig(**config_dict)
-        print("loading model")
 
-        # Disable defer_lora_injection so LoRA layers are created during init,
-        # matching the PEFT key hierarchy (base_model.model.*) in the checkpoint.
         ah_cfg = config.action_head_cfg
         inner = ah_cfg.get('config', ah_cfg) if isinstance(ah_cfg.get('config'), dict) else ah_cfg
-        if 'defer_lora_injection' in inner:
-            inner['defer_lora_injection'] = False
-            print("defer_lora_injection disabled for load_lora")
-        # Enable component loading so DiT base weights are loaded from pretrained
-        if 'skip_component_loading' in inner:
-            inner['skip_component_loading'] = False
-            print("skip_component_loading disabled for load_lora")
 
-        # Instantiate model (LoRA layers now exist from init)
-        model = cls(config)
+        if pretrained_base_model_path and os.path.isdir(pretrained_base_model_path):
+            # Mirror training: skip_component_loading=True (don't load raw Wan),
+            # defer_lora_injection=True (inject after base weights are loaded)
+            if 'skip_component_loading' in inner:
+                inner['skip_component_loading'] = True
+                print("skip_component_loading=True (will load base model weights separately)")
+            if 'defer_lora_injection' in inner:
+                inner['defer_lora_injection'] = True
+                print("defer_lora_injection=True (will inject LoRA after base weights)")
 
+            print("Creating model (without DiT weights or LoRA)...")
+            model = cls(config)
+
+            # --- 4. Load pretrained base model weights (e.g. DreamZero-AgiBot) ---
+            print(f"Loading pretrained base model from: {pretrained_base_model_path}")
+            base_safetensors_path = os.path.join(pretrained_base_model_path, "model.safetensors")
+            base_index_path = os.path.join(pretrained_base_model_path, "model.safetensors.index.json")
+
+            if os.path.exists(base_index_path):
+                with open(base_index_path, 'r') as f:
+                    base_index = json.load(f)
+                for shard_file in sorted(set(base_index["weight_map"].values())):
+                    shard_path = os.path.join(pretrained_base_model_path, shard_file)
+                    print(f"Loading base model shard: {shard_path}")
+                    shard_state_dict = load_file(shard_path)
+                    model.load_state_dict(shard_state_dict, strict=False)
+                    del shard_state_dict
+                    gc.collect()
+            elif os.path.exists(base_safetensors_path):
+                base_state_dict = load_file(base_safetensors_path)
+                model.load_state_dict(base_state_dict, strict=False)
+                del base_state_dict
+                gc.collect()
+            else:
+                raise FileNotFoundError(
+                    f"No base model weights found at '{pretrained_base_model_path}'. "
+                    "Expected 'model.safetensors' or 'model.safetensors.index.json'."
+                )
+            print("Successfully loaded pretrained base model weights")
+
+            # --- 5. Inject LoRA adapters (mirrors training: inject_lora_after_loading) ---
+            if (hasattr(model, 'action_head')
+                    and hasattr(model.action_head, 'inject_lora_after_loading')
+                    and model.action_head.config.defer_lora_injection):
+                model.action_head.inject_lora_after_loading()
+        else:
+            # Fallback: original behavior (load Wan base from pretrained path)
+            if pretrained_base_model_path:
+                print(f"WARNING: pretrained_base_model_path '{pretrained_base_model_path}' not found, "
+                      f"falling back to loading DiT from diffusion_model_pretrained_path")
+            else:
+                print("WARNING: No pretrained_model_path found in experiment config, "
+                      "falling back to loading DiT from diffusion_model_pretrained_path")
+            if 'defer_lora_injection' in inner:
+                inner['defer_lora_injection'] = False
+            if 'skip_component_loading' in inner:
+                inner['skip_component_loading'] = False
+
+            print("Creating model (with Wan DiT base + LoRA from init)...")
+            model = cls(config)
+
+        # --- 6. Load LoRA checkpoint weights ---
         # Remove .base_layer from keys if present
-        has_base_layer = any(".base_layer." in key for key in state_dict.keys())
+        has_base_layer = any(".base_layer." in key for key in lora_state_dict.keys())
         if has_base_layer:
-            print("Removing '.base_layer' from state dict keys")
-            state_dict = {k.replace(".base_layer.", "."): v for k, v in state_dict.items()}
+            print("Removing '.base_layer' from LoRA state dict keys")
+            lora_state_dict = {k.replace(".base_layer.", "."): v for k, v in lora_state_dict.items()}
 
-        # Load weights
-        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-            
+        missing_keys, unexpected_keys = model.load_state_dict(lora_state_dict, strict=False)
+
         if missing_keys:
-            print(f"Missing keys when loading pretrained weights: {missing_keys}")
+            print(f"Missing keys when loading LoRA weights (expected for base model params): "
+                  f"{len(missing_keys)} keys")
         if unexpected_keys:
-            print(f"Unexpected keys when loading pretrained weights: {unexpected_keys}")
-        
-        print("Successfully loaded pretrained weights")
+            print(f"Unexpected keys when loading LoRA weights: {unexpected_keys}")
 
+        print("Successfully loaded LoRA checkpoint weights")
         print(f"{cls}\n")
         return model
 
