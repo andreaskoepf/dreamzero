@@ -349,12 +349,15 @@ def save_action_plots(gt_actions: dict, pred_actions: dict,
 # ---------------------------------------------------------------------------
 
 def run_episode_rollout(policy, dataset, episode_id, table, start_row, task,
-                        num_chunks, rank):
+                        num_chunks, rank, ar_rollout=False):
     """Run multi-chunk AR rollout for one episode.
 
-    The model internally tracks `current_start_frame` and KV cache across
-    calls to `lazy_joint_forward_causal`. We feed GT observations at each
-    chunk boundary (open-loop w.r.t. actions, GT-conditioned video).
+    When ar_rollout=False (default): each chunk is conditioned on a fresh GT
+    frame at its time position (open-loop w.r.t. actions, GT-conditioned video).
+
+    When ar_rollout=True: only the first chunk gets a GT frame.  Subsequent
+    chunks feed the previous chunk's latent video prediction back into the
+    model, producing a longer video from a single start frame.
 
     Returns:
         all_pred_actions: dict of concatenated actions across chunks
@@ -377,18 +380,30 @@ def run_episode_rollout(policy, dataset, episode_id, table, start_row, task,
     policy.trained_model.action_head.language = None
     policy.trained_model.action_head.current_start_frame = 0
 
+    prev_video_pred = None
+
     for chunk_idx in range(num_chunks):
-        # Current frame position for this chunk
+        # Current frame position for this chunk (for GT actions comparison)
         current_row = min(start_row + chunk_idx * ACTION_HORIZON, ep_len - 1)
 
-        # Build observation from GT data at this position
-        obs = build_obs(dataset, episode_id, table, current_row, task)
+        if ar_rollout and chunk_idx > 0:
+            # AR continuation: reuse the first chunk's GT frame observation
+            # but pass the previous chunk's latent video as conditioning.
+            obs = build_obs(dataset, episode_id, table, start_row, task)
+        else:
+            # GT-conditioned: build observation from GT data at this position
+            obs = build_obs(dataset, episode_id, table, current_row, task)
 
         t0 = time.perf_counter()
         with torch.inference_mode():
-            result_batch, video_pred = policy.lazy_joint_forward_causal(Batch(obs=obs))
+            latent_video_arg = prev_video_pred if (ar_rollout and chunk_idx > 0) else None
+            result_batch, video_pred = policy.lazy_joint_forward_causal(
+                Batch(obs=obs), latent_video=latent_video_arg,
+            )
         elapsed = time.perf_counter() - t0
         total_time += elapsed
+
+        prev_video_pred = video_pred
 
         # Extract predictions
         chunk_pred = extract_pred_actions(result_batch)
@@ -412,8 +427,9 @@ def run_episode_rollout(policy, dataset, episode_id, table, start_row, task,
         if video_pred is not None:
             all_latent_videos.append(video_pred)
 
+        mode = "AR" if (ar_rollout and chunk_idx > 0) else "GT"
         if rank == 0:
-            print(f"    Chunk {chunk_idx+1}/{num_chunks}: row={current_row}, "
+            print(f"    Chunk {chunk_idx+1}/{num_chunks} [{mode}]: row={current_row}, "
                   f"MSE={chunk_mse:.6f}, time={elapsed:.2f}s")
 
     # Concatenate across chunks
@@ -472,7 +488,7 @@ def evaluate(args):
         # Multi-chunk AR rollout
         all_pred, all_gt, all_latents, total_time, per_chunk_mse = run_episode_rollout(
             policy, dataset, episode_id, table, start_row, task,
-            args.num_chunks, rank,
+            args.num_chunks, rank, ar_rollout=args.ar_rollout,
         )
 
         # Overall MSE
@@ -585,6 +601,10 @@ def main():
                    help="Number of AR chunks per episode (each = 24 action steps)")
     p.add_argument("--seed", type=int, default=42,
                    help="Random seed for episode/position selection")
+    p.add_argument("--ar_rollout", action="store_true",
+                   help="Generate longer video from a single start frame by chaining "
+                        "each chunk's latent output as conditioning for the next chunk, "
+                        "instead of re-conditioning on GT at each chunk boundary")
     p.add_argument("--output_dir", default="results_dk1_eval")
     main_args = p.parse_args()
     evaluate(main_args)

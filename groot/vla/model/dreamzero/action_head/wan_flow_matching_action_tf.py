@@ -971,7 +971,7 @@ class WANPolicyHead(ActionHead):
             print("language changed, reset current_start_frame to 0")
             self.current_start_frame = 0
             self.language = data["text"]
-        elif videos.shape[2] == 1:
+        elif videos.shape[2] == 1 and latent_video is None:
             self.current_start_frame = 0
         elif self.current_start_frame >= self.model.local_attn_size:
             self.current_start_frame = 0
