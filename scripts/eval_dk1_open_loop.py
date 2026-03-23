@@ -516,9 +516,12 @@ def evaluate(args):
             # Decode and save videos
             if all_latents:
                 try:
-                    # Concatenate latent videos across chunks and decode
-                    latent_cat = torch.cat(all_latents, dim=2)
-                    pred_frames = decode_latent_video(policy, latent_cat)
+                    # Decode each chunk independently to avoid VAE temporal
+                    # interpolation artifacts at chunk boundaries.
+                    chunk_frames = []
+                    for lat in all_latents:
+                        chunk_frames.append(decode_latent_video(policy, lat))
+                    pred_frames = np.concatenate(chunk_frames, axis=0)
                     n_pred_frames = pred_frames.shape[0]
 
                     # Save full tiled prediction
