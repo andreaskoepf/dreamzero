@@ -65,12 +65,39 @@ EXCLUDE_NAMES = {
     "FabianKerj_dualarm-pretrain-417ep",
     "Zasha01_eval_pi05-cube-transfer-final-full15",
     "Zasha01_eval_pi05-cube-transfer_v1",
+    # Duplicates: daily t-shirt datasets are a subset of trlc_tshirt_folding
+    "Gongsta_dk1_2026-02-28",
+    "Gongsta_dk1_2026-03-01",
+    "Gongsta_dk1_2026-03-02",
+    "Gongsta_dk1_2026-03-03",
+    # Duplicates: 100% contained in pingpongmegamerge
+    "qualiaadmin_pingpongred1",
+    # Duplicates: 100% contained in FabianKerj_dualarm-pretrain-127ep
+    "qualiaadmin_mandminbox",
+    "qualiaadmin_plasticinbox50episodesimpedance",
+    # Bad data: mixed camera streams across episodes (contradictory visual/action)
+    "qualiaadmin_pingpongmegamerge",
+    # Bad data: wrong camera streams for context & left_wrist (show operator)
+    "qualiaadmin_spoon1",
 }
 
 # Overview camera names → normalised name "top"
-OVERVIEW_CAM_NAMES = {"top", "context", "base_0"}
-WRIST_CAMS = {"left_wrist", "right_wrist"}
-TARGET_CAM_NAMES = ["top", "left_wrist", "right_wrist"]  # output camera order
+OVERVIEW_CAM_NAMES = {"top", "context", "base_0", "head", "camera_0"}
+WRIST_CAMS = {"left_wrist", "right_wrist", "camera_1", "camera_2"}
+TARGET_CAM_NAMES = ["head", "left_wrist", "right_wrist"]  # output camera order
+
+# Source camera name → target camera name
+CAM_NAME_REMAP = {
+    "top": "head",
+    "context": "head",
+    "base_0": "head",
+    "head": "head",
+    "camera_0": "head",
+    "left_wrist": "left_wrist",
+    "camera_1": "left_wrist",
+    "right_wrist": "right_wrist",
+    "camera_2": "right_wrist",
+}
 
 FPS = 30
 CHUNKS_SIZE = 1000
@@ -215,7 +242,7 @@ def validate_dataset(ds: dict) -> list[str]:
         chunk_name = pf.parent.name  # e.g., "chunk-000"
         file_stem = pf.stem  # e.g., "file-000"
 
-        for cam_name in [overview_cam] + sorted(WRIST_CAMS):
+        for cam_name in [overview_cam] + cam_info["wrists"]:
             full_cam_key = f"observation.images.{cam_name}"
             video_path = ds_path / "videos" / full_cam_key / chunk_name / f"{file_stem}.mp4"
             if not video_path.exists():
@@ -418,16 +445,56 @@ def _reencode_worker(args: tuple) -> tuple[str, bool]:
     return str(dst), ok
 
 
+def _get_frame_count(video_path: Path) -> int:
+    """Get frame count from a video file using ffprobe (no RAM usage).
+
+    Uses the fast nb_frames metadata first (reliable for h264 mp4).
+    Falls back to slow -count_frames only if metadata is unavailable.
+    """
+    # Fast path: read nb_frames from container metadata
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "quiet", "-select_streams", "v:0",
+                "-show_entries", "stream=nb_frames",
+                "-of", "csv=p=0", str(video_path),
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        count = int(result.stdout.strip())
+        if count > 0:
+            return count
+    except (ValueError, AttributeError):
+        pass
+    except Exception as e:
+        log.warning("ffprobe fast path failed for %s: %s", video_path, e)
+
+    # Slow fallback: decode all frames to count them
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "quiet", "-select_streams", "v:0",
+                "-count_frames", "-show_entries", "stream=nb_read_frames",
+                "-of", "csv=p=0", str(video_path),
+            ],
+            capture_output=True, text=True, timeout=300,
+        )
+        return int(result.stdout.strip())
+    except Exception as e:
+        log.error("Failed to get frame count for %s: %s", video_path, e)
+        return 0
+
+
 def build_source_video_frame_map(
     ds_path: Path,
     cam_key: str,
 ) -> list[tuple[Path, int, int]]:
     """Build a cumulative frame map for a camera's video files in a source dataset.
 
+    Uses ffprobe to count frames — no video data loaded into RAM.
+
     Returns list of (video_path, cumulative_start, num_frames).
     """
-    import decord
-
     cam_dir = ds_path / "videos" / cam_key
     if not cam_dir.exists():
         return []
@@ -438,8 +505,7 @@ def build_source_video_frame_map(
         if not chunk_dir.is_dir():
             continue
         for vf in sorted(chunk_dir.glob("file-*.mp4")):
-            vr = decord.VideoReader(str(vf))
-            n_frames = len(vr)
+            n_frames = _get_frame_count(vf)
             entries.append((vf, cum_start, n_frames))
             cum_start += n_frames
     return entries
@@ -631,7 +697,10 @@ def batch_split_source_video(
     fps: int = 30,
     resume: bool = False,
 ) -> tuple[int, int]:
-    """Read one source video file once, split into per-episode output videos.
+    """Split a source video into per-episode output videos using ffmpeg only.
+
+    Uses ffmpeg seeking + frame count extraction — no decord, no loading frames
+    into RAM. This keeps memory usage minimal even for very large source videos.
 
     Args:
         source_video_path: Path to the source .mp4 file.
@@ -643,8 +712,6 @@ def batch_split_source_video(
 
     Returns (num_success, num_failures).
     """
-    import decord
-
     # Filter out already-done episodes if resuming
     if resume:
         episode_splits = [
@@ -655,42 +722,51 @@ def batch_split_source_video(
     if not episode_splits:
         return 0, 0
 
-    # Read entire source video once (sequential read — network friendly)
-    try:
-        vr = decord.VideoReader(str(source_video_path))
-    except Exception as e:
-        log.error("Failed to open video %s: %s", source_video_path, e)
-        return 0, len(episode_splits)
-
-    total_video_frames = len(vr)
     successes = 0
     failures = 0
 
-    for local_start, num_frames, output_path in episode_splits:
-        local_end = min(local_start + num_frames, total_video_frames)
-        actual_frames = local_end - local_start
+    vf = (
+        f"scale={target_width}:{target_height}"
+        f":force_original_aspect_ratio=increase,"
+        f"crop={target_width}:{target_height}"
+    )
 
-        if actual_frames <= 0:
-            log.warning("No frames for %s (start=%d, total=%d)", output_path.name, local_start, total_video_frames)
-            failures += 1
-            continue
+    for local_start, num_frames, output_path in episode_splits:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Use ffmpeg to seek by timestamp and extract exact frame count.
+        # Seeking by time is faster than frame-accurate seeking for large files.
+        start_time = local_start / fps
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", f"{start_time:.6f}",
+            "-i", str(source_video_path),
+            "-frames:v", str(num_frames),
+            "-vf", vf,
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-crf", "23",
+            "-pix_fmt", "yuv420p",
+            "-an",
+            str(output_path),
+        ]
 
         try:
-            indices = list(range(local_start, local_end))
-            frames = vr.get_batch(indices).asnumpy()
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=600,
+            )
+            if result.returncode != 0:
+                log.error("ffmpeg failed for %s: %s", output_path, result.stderr[-500:])
+                failures += 1
+            else:
+                successes += 1
+        except subprocess.TimeoutExpired:
+            log.error("ffmpeg timed out for %s", output_path)
+            failures += 1
         except Exception as e:
-            log.error("Failed to read frames %d-%d from %s: %s", local_start, local_end, source_video_path, e)
+            log.error("ffmpeg error for %s: %s", output_path, e)
             failures += 1
-            continue
-
-        ok = _write_frames_to_video(frames, output_path, target_width, target_height, fps)
-        if ok:
-            successes += 1
-        else:
-            failures += 1
-
-        # Free memory
-        del frames
 
     return successes, failures
 
@@ -1093,11 +1169,14 @@ def main():
         overview_cam = ds["cam_info"]["overview"]
 
         # Build video frame maps for this dataset (one per camera)
+        # Map source camera names to target names using CAM_NAME_REMAP
+        wrist_cams = ds["cam_info"]["wrists"]  # e.g. ["camera_1", "camera_2"] or ["left_wrist", "right_wrist"]
         cam_mapping = {
-            f"observation.images.{overview_cam}": "observation.images.top",
-            "observation.images.left_wrist": "observation.images.left_wrist",
-            "observation.images.right_wrist": "observation.images.right_wrist",
+            f"observation.images.{overview_cam}": "observation.images.head",
         }
+        for wc in wrist_cams:
+            target = CAM_NAME_REMAP.get(wc, wc)
+            cam_mapping[f"observation.images.{wc}"] = f"observation.images.{target}"
         cam_frame_maps: dict[str, list[tuple[Path, int, int]]] = {}
         if not args.skip_videos:
             for src_cam_key in cam_mapping:
@@ -1105,9 +1184,34 @@ def main():
                     ds["path"], src_cam_key,
                 )
 
+        # Detect 1:1 layout: each parquet file has exactly one episode and
+        # corresponds to a matching video file (which may have extra frames).
+        # In this case we use direct file-to-file mapping instead of cumulative offsets.
+        is_one_to_one = (
+            len(ds["parquet_files"]) > 1
+            and all(
+                len(pd.read_parquet(pf, columns=["episode_index"])["episode_index"].unique()) == 1
+                for pf in ds["parquet_files"][:3]  # sample first 3 to detect
+            )
+        )
+        if is_one_to_one:
+            log.info("  %s: detected 1:1 layout (one episode per file)", ds["name"])
+
+        # Load per-episode video timestamps from episodes parquet (if available).
+        # Maps (episode_index, cam_key) -> from_timestamp for seeking into video.
+        ep_video_offsets: dict[tuple[int, str], float] = {}
+        ep_parquet_path = ds["path"] / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
+        if ep_parquet_path.exists():
+            ep_meta_df = pd.read_parquet(ep_parquet_path)
+            for _, row in ep_meta_df.iterrows():
+                ep_i = int(row["episode_index"])
+                for src_cam_key in cam_mapping:
+                    ts_col = f"videos/{src_cam_key}/from_timestamp"
+                    if ts_col in ep_meta_df.columns:
+                        ep_video_offsets[(ep_i, src_cam_key)] = float(row[ts_col])
+
         # Track cumulative row offset across parquet files within this dataset.
-        # This is the correct video frame offset — it counts rows sequentially
-        # rather than relying on the parquet "index" column which may not start at 0.
+        # Used for packed layout where multiple episodes are concatenated in video files.
         ds_row_offset = 0
 
         for pf in ds["parquet_files"]:
@@ -1159,30 +1263,55 @@ def main():
 
                 # Queue video extraction jobs
                 if not args.skip_videos:
-                    # Video frame offset = cumulative rows from prior parquet files
-                    # + row offset of this episode within the current file
-                    video_global_start = ds_row_offset + row_offset_in_file
+                    if is_one_to_one:
+                        # 1:1 layout: source video file matches parquet file directly.
+                        # Respects from_timestamp to skip leading frames if needed.
+                        pf_chunk = pf.parent.name  # e.g. "chunk-000"
+                        pf_stem = pf.stem  # e.g. "file-000"
+                        for src_cam_key, dst_cam_key in cam_mapping.items():
+                            dst_video = (
+                                output_path / "videos" / dst_cam_key
+                                / f"chunk-{chunk_idx:03d}" / f"file-{file_idx:03d}.mp4"
+                            )
+                            if args.resume and dst_video.exists():
+                                skipped_videos += 1
+                                continue
+                            src_video = ds["path"] / "videos" / src_cam_key / pf_chunk / f"{pf_stem}.mp4"
+                            if not src_video.exists():
+                                log.warning("Missing source video: %s", src_video)
+                                continue
+                            # Use from_timestamp to compute starting frame offset
+                            from_ts = ep_video_offsets.get((orig_ep_idx, src_cam_key), 0.0)
+                            frame_offset = round(from_ts * ds["fps"])
+                            fm_serialized = [(str(src_video), 0, frame_offset + n_frames + 100)]
+                            video_jobs.append((
+                                fm_serialized, frame_offset, n_frames,
+                                str(dst_video), args.target_width, args.target_height, FPS,
+                            ))
+                    else:
+                        # Packed layout: cumulative offset into concatenated video stream
+                        video_global_start = ds_row_offset + row_offset_in_file
 
-                    for src_cam_key, dst_cam_key in cam_mapping.items():
-                        dst_video = (
-                            output_path / "videos" / dst_cam_key
-                            / f"chunk-{chunk_idx:03d}" / f"file-{file_idx:03d}.mp4"
-                        )
+                        for src_cam_key, dst_cam_key in cam_mapping.items():
+                            dst_video = (
+                                output_path / "videos" / dst_cam_key
+                                / f"chunk-{chunk_idx:03d}" / f"file-{file_idx:03d}.mp4"
+                            )
 
-                        if args.resume and dst_video.exists():
-                            skipped_videos += 1
-                            continue
+                            if args.resume and dst_video.exists():
+                                skipped_videos += 1
+                                continue
 
-                        frame_map = cam_frame_maps.get(src_cam_key, [])
-                        if not frame_map:
-                            continue
+                            frame_map = cam_frame_maps.get(src_cam_key, [])
+                            if not frame_map:
+                                continue
 
-                        # Serialize frame_map for multiprocessing
-                        fm_serialized = [(str(p), cs, nf) for p, cs, nf in frame_map]
-                        video_jobs.append((
-                            fm_serialized, video_global_start, n_frames,
-                            str(dst_video), args.target_width, args.target_height, FPS,
-                        ))
+                            # Serialize frame_map for multiprocessing
+                            fm_serialized = [(str(p), cs, nf) for p, cs, nf in frame_map]
+                            video_jobs.append((
+                                fm_serialized, video_global_start, n_frames,
+                                str(dst_video), args.target_width, args.target_height, FPS,
+                            ))
 
                 global_frame_index += n_frames
                 global_episode_index += 1
@@ -1324,31 +1453,67 @@ def main():
     else:
         log.info("  Skipping stats (--skip-stats)")
 
-    # README.md - provenance
-    readme_lines = [
-        "# DK-1 Merged Dataset",
-        "",
-        f"Generated: 2026-03-18",
-        f"Total episodes: {total_episodes}",
-        f"Total frames: {total_frames}",
-        f"Total tasks: {len(tasks)}",
-        f"Resolution: {args.target_width}x{args.target_height}",
-        f"Codec: h264",
-        f"FPS: {FPS}",
-        "",
-        "## Source datasets",
-        "",
-    ]
+    # README.md - HuggingFace dataset card
+    from datetime import date
+    today = date.today().isoformat()
+
+    # Build source dataset table with HF repo links
+    source_rows = []
     for ds in included:
-        readme_lines.append(f"- {ds['name']} ({len(ds['parquet_files'])} episodes, {ds['total_frames']} frames)")
-    readme_lines.append("")
-    readme_lines.append("## Excluded datasets")
-    readme_lines.append("")
-    for ex in excluded:
-        readme_lines.append(f"- {ex['name']}: {ex['reason']}")
+        # Convert local name back to HF repo format (first _ becomes /)
+        name = ds["name"]
+        parts = name.split("_", 1)
+        hf_repo = f"{parts[0]}/{parts[1]}" if len(parts) > 1 else name
+        source_rows.append(f"| [{hf_repo}](https://huggingface.co/datasets/{hf_repo}) |")
+
+    readme = f"""---
+license: apache-2.0
+task_categories:
+- robotics
+tags:
+- LeRobot
+configs:
+- config_name: default
+  data_files: data/*/*.parquet
+---
+
+# DK-1 Merged Dataset
+
+This dataset was created using [LeRobot](https://github.com/huggingface/lerobot).
+
+<a class="flex" href="https://huggingface.co/spaces/lerobot/visualize_dataset?path=andreaskoepf/dk1-merge-2026-03">
+<img class="block dark:hidden" src="https://huggingface.co/datasets/huggingface/badges/resolve/main/visualize-this-dataset-xl.svg"/>
+<img class="hidden dark:block" src="https://huggingface.co/datasets/huggingface/badges/resolve/main/visualize-this-dataset-xl-dark.svg"/>
+</a>
+
+## Dataset Description
+
+Merged and deduplicated DK-1 bimanual robot dataset. All source videos are re-encoded to {args.target_width}x{args.target_height} h264 at {FPS} FPS with {TARGET_ACTION_DIM}D joint-space actions.
+
+- **Generated:** {today}
+- **Total episodes:** {total_episodes:,}
+- **Total frames:** {total_frames:,}
+- **Total tasks:** {len(tasks)}
+- **Resolution:** {args.target_width}x{args.target_height}
+- **Codec:** h264
+- **FPS:** {FPS}
+- **Cameras:** {", ".join(TARGET_CAM_NAMES)}
+- **Action dim:** {TARGET_ACTION_DIM} (6 joint + 1 gripper per arm)
+
+## Source Datasets
+
+| Dataset |
+|---|
+{chr(10).join(source_rows)}
+
+## Excluded Datasets
+
+| Dataset | Reason |
+|---|---|
+""" + "\n".join(f"| {ex['name']} | {ex['reason']} |" for ex in excluded) + "\n"
 
     with open(output_path / "README.md", "w") as f:
-        f.write("\n".join(readme_lines) + "\n")
+        f.write(readme)
     log.info("  Wrote README.md")
 
     # ------------------------------------------------------------------
