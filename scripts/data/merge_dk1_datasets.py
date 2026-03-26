@@ -99,7 +99,7 @@ CAM_NAME_REMAP = {
     "camera_2": "right_wrist",
 }
 
-FPS = 30
+DEFAULT_FPS = 30
 CHUNKS_SIZE = 1000
 TARGET_ACTION_DIM = 14
 TARGET_STATE_DIM = 14
@@ -205,7 +205,7 @@ def discover_datasets(data_root: Path) -> tuple[list[dict], list[dict]]:
             "action_dim": action_dim,
             "parquet_files": parquet_files,
             "total_frames": total_frames,
-            "fps": info.get("fps", FPS),
+            "fps": info.get("fps", DEFAULT_FPS),
         })
 
     return included, excluded
@@ -1259,6 +1259,7 @@ def main():
                     "episode_index": global_episode_index,
                     "tasks": ep_tasks,
                     "length": n_frames,
+                    "fps": ds["fps"],
                 })
 
                 # Queue video extraction jobs
@@ -1286,7 +1287,7 @@ def main():
                             fm_serialized = [(str(src_video), 0, frame_offset + n_frames + 100)]
                             video_jobs.append((
                                 fm_serialized, frame_offset, n_frames,
-                                str(dst_video), args.target_width, args.target_height, FPS,
+                                str(dst_video), args.target_width, args.target_height, ds["fps"],
                             ))
                     else:
                         # Packed layout: cumulative offset into concatenated video stream
@@ -1310,7 +1311,7 @@ def main():
                             fm_serialized = [(str(p), cs, nf) for p, cs, nf in frame_map]
                             video_jobs.append((
                                 fm_serialized, video_global_start, n_frames,
-                                str(dst_video), args.target_width, args.target_height, FPS,
+                                str(dst_video), args.target_width, args.target_height, ds["fps"],
                             ))
 
                 global_frame_index += n_frames
@@ -1330,7 +1331,8 @@ def main():
         # video_jobs contains: (fm_serialized, video_global_start, n_frames, dst_path, tw, th, fps)
         # We need to reorganize: for each source video file → list of (local_start, n_frames, output_path)
         from collections import defaultdict
-        batch_jobs: dict[str, list[tuple[int, int, str]]] = defaultdict(list)
+        # (src_path -> (episode_splits, fps))
+        batch_jobs: dict[str, tuple[list[tuple[int, int, str]], int]] = {}
 
         crossfile_jobs = []  # fallback jobs for episodes spanning multiple files
 
@@ -1344,7 +1346,9 @@ def main():
                     local_start = video_global_start - cum_start
                     if local_start + n_frames <= file_nframes:
                         # Episode fits entirely in this file — use batch path
-                        batch_jobs[src_path_str].append((local_start, n_frames, dst_path))
+                        if src_path_str not in batch_jobs:
+                            batch_jobs[src_path_str] = ([], fps_val)
+                        batch_jobs[src_path_str][0].append((local_start, n_frames, dst_path))
                     else:
                         # Episode spans files — queue for sequential extraction
                         log.warning("Episode spans video files at %s frame %d — using fallback", src_path_str, video_global_start)
@@ -1360,17 +1364,17 @@ def main():
             frame_map = [(Path(p), cs, nf) for p, cs, nf in fm_serialized]
             extract_episode_video(frame_map, video_global_start, n_frames, Path(dst_path), tw, th, fps_val)
 
-        total_batch_episodes = sum(len(eps) for eps in batch_jobs.values())
+        total_batch_episodes = sum(len(eps) for eps, _ in batch_jobs.values())
         log.info("  Batch splitting: %d source videos → %d episode videos (%d workers)",
                  len(batch_jobs), total_batch_episodes, args.ffmpeg_workers)
 
         # Submit batch jobs (one per source video file)
         batch_job_list = []
-        for src_path, episode_splits in batch_jobs.items():
+        for src_path, (episode_splits, fps_val) in batch_jobs.items():
             serialized_splits = [(s, n, str(o)) for s, n, o in episode_splits]
             batch_job_list.append((
                 src_path, serialized_splits,
-                args.target_width, args.target_height, FPS, args.resume,
+                args.target_width, args.target_height, fps_val, args.resume,
             ))
 
         total_successes = 0
@@ -1394,7 +1398,14 @@ def main():
     meta_dir.mkdir(parents=True, exist_ok=True)
 
     # info.json
-    info = build_info_json(total_episodes, total_frames, len(tasks), FPS, args.target_width, args.target_height)
+    # Use the most common fps across episodes for the top-level fps field
+    from collections import Counter
+    fps_counts = Counter(ep["fps"] for ep in episodes_meta)
+    dominant_fps = fps_counts.most_common(1)[0][0]
+    all_fps = sorted(fps_counts.keys())
+    if len(all_fps) > 1:
+        log.info("  Mixed FPS detected: %s (using %d for info.json)", dict(fps_counts), dominant_fps)
+    info = build_info_json(total_episodes, total_frames, len(tasks), dominant_fps, args.target_width, args.target_height)
     # Calculate actual file sizes
     data_size = sum(f.stat().st_size for f in output_path.rglob("data/**/*.parquet")) / (1024 * 1024)
     video_size = sum(f.stat().st_size for f in output_path.rglob("videos/**/*.mp4")) / (1024 * 1024)
@@ -1488,7 +1499,7 @@ This dataset was created using [LeRobot](https://github.com/huggingface/lerobot)
 
 ## Dataset Description
 
-Merged and deduplicated DK-1 bimanual robot dataset. All source videos are re-encoded to {args.target_width}x{args.target_height} h264 at {FPS} FPS with {TARGET_ACTION_DIM}D joint-space actions.
+Merged and deduplicated DK-1 bimanual robot dataset. All source videos are re-encoded to {args.target_width}x{args.target_height} h264 with {TARGET_ACTION_DIM}D joint-space actions. Per-episode FPS is preserved from the source datasets.
 
 - **Generated:** {today}
 - **Total episodes:** {total_episodes:,}
@@ -1496,7 +1507,7 @@ Merged and deduplicated DK-1 bimanual robot dataset. All source videos are re-en
 - **Total tasks:** {len(tasks)}
 - **Resolution:** {args.target_width}x{args.target_height}
 - **Codec:** h264
-- **FPS:** {FPS}
+- **FPS:** {", ".join(str(f) for f in all_fps)} (per-episode, stored in episodes.jsonl)
 - **Cameras:** {", ".join(TARGET_CAM_NAMES)}
 - **Action dim:** {TARGET_ACTION_DIM} (6 joint + 1 gripper per arm)
 
