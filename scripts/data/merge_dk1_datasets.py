@@ -81,6 +81,12 @@ EXCLUDE_NAMES = {
     "qualiaadmin_spoon1",
     # No video files at all (incomplete upload)
     "Gongsta_dagger_dk1_tshirt_corrections",
+    # Inconsistent camera mapping across episodes
+    "apaszynska_merged_diffrenet_grips",
+    "apaszynska_merged-slow-regrasp-200ep",
+    # Different embodiment (top-down mount, inverted wrists)
+    "apaszynska_merged-dataset-regrasp-200",
+    "apaszynska_portafilter-to-grinder-regrasp-v6-with-sticker",
 }
 
 # Overview camera names → normalised name "top"
@@ -96,9 +102,9 @@ CAM_NAME_REMAP = {
     "head": "head",
     "camera_0": "head",
     "left_wrist": "left_wrist",
-    "camera_1": "left_wrist",
+    "camera_1": "right_wrist",
     "right_wrist": "right_wrist",
-    "camera_2": "right_wrist",
+    "camera_2": "left_wrist",
 }
 
 DEFAULT_FPS = 30
@@ -1465,10 +1471,12 @@ def main():
         json.dump(embodiment, f, indent=4)
     log.info("  Wrote embodiment.json")
 
+    # Collect all merged parquet paths (used by stats + HF metadata)
+    merged_parquets = sorted(output_path.rglob("data/**/*.parquet"))
+
     # stats.json
     if not args.skip_stats:
         log.info("  Computing stats...")
-        merged_parquets = sorted(output_path.rglob("data/**/*.parquet"))
         stats = compute_stats(merged_parquets, ["observation.state", "action"])
         with open(meta_dir / "stats.json", "w") as f:
             json.dump(stats, f, indent=4)
@@ -1541,6 +1549,93 @@ Merged and deduplicated DK-1 bimanual robot dataset. All source videos are re-en
     with open(output_path / "README.md", "w") as f:
         f.write(readme)
     log.info("  Wrote README.md")
+
+    # Add HuggingFace metadata to data parquets (needed for HF dataset viewer)
+    import pyarrow.parquet as pq
+    hf_parquet_meta = json.dumps({
+        "info": {
+            "features": {
+                "action": {"feature": {"dtype": "float32", "_type": "Value"}, "length": TARGET_ACTION_DIM, "_type": "List"},
+                "observation.state": {"feature": {"dtype": "float32", "_type": "Value"}, "length": TARGET_STATE_DIM, "_type": "List"},
+                "timestamp": {"dtype": "float32", "_type": "Value"},
+                "frame_index": {"dtype": "int64", "_type": "Value"},
+                "episode_index": {"dtype": "int64", "_type": "Value"},
+                "index": {"dtype": "int64", "_type": "Value"},
+                "task_index": {"dtype": "int64", "_type": "Value"},
+            }
+        }
+    }).encode("utf-8")
+
+    log.info("  Adding HuggingFace metadata to data parquets...")
+    for pf in tqdm(merged_parquets, desc="HF metadata"):
+        table = pq.read_table(pf)
+        existing = table.schema.metadata or {}
+        existing[b"huggingface"] = hf_parquet_meta
+        table = table.replace_schema_metadata(existing)
+        pq.write_table(table, pf)
+
+    # Episodes parquet (for HF dataset viewer — has per-episode stats and video mapping)
+    log.info("  Generating episodes parquet...")
+    ep_rows = []
+    cumulative_index = 0
+    cam_keys = [f"observation.images.{c}" for c in TARGET_CAM_NAMES]
+
+    for ep in tqdm(episodes_meta, desc="Episodes parquet"):
+        ep_idx = ep["episode_index"]
+        length = ep["length"]
+        ep_fps = ep.get("fps", dominant_fps)
+        chunk_idx = ep_idx // CHUNKS_SIZE
+        file_idx = ep_idx % CHUNKS_SIZE
+
+        row = {
+            "episode_index": ep_idx,
+            "tasks": ep["tasks"],
+            "length": length,
+            "fps": ep_fps,
+            "data/chunk_index": chunk_idx,
+            "data/file_index": file_idx,
+            "dataset_from_index": cumulative_index,
+            "dataset_to_index": cumulative_index + length,
+        }
+        for cam in cam_keys:
+            row[f"videos/{cam}/chunk_index"] = chunk_idx
+            row[f"videos/{cam}/file_index"] = file_idx
+            row[f"videos/{cam}/from_timestamp"] = 0.0
+            row[f"videos/{cam}/to_timestamp"] = (length - 1) / ep_fps
+
+        # Per-episode stats
+        pq_path = output_path / f"data/chunk-{chunk_idx:03d}/file-{file_idx:03d}.parquet"
+        df = pd.read_parquet(pq_path)
+        for col in ["action", "observation.state"]:
+            arr = np.stack(df[col].values).astype(np.float64)
+            row[f"stats/{col}/min"] = np.min(arr, axis=0).tolist()
+            row[f"stats/{col}/max"] = np.max(arr, axis=0).tolist()
+            row[f"stats/{col}/mean"] = np.mean(arr, axis=0).tolist()
+            row[f"stats/{col}/std"] = np.std(arr, axis=0).tolist()
+            row[f"stats/{col}/count"] = [len(arr)]
+            for q in [0.01, 0.10, 0.50, 0.90, 0.99]:
+                qname = f"q{int(q*100):02d}"
+                row[f"stats/{col}/{qname}"] = np.quantile(arr, q, axis=0).tolist()
+        for col in ["timestamp", "frame_index", "episode_index", "index", "task_index"]:
+            arr = df[col].values.astype(np.float64)
+            row[f"stats/{col}/min"] = [float(np.min(arr))]
+            row[f"stats/{col}/max"] = [float(np.max(arr))]
+            row[f"stats/{col}/mean"] = [float(np.mean(arr))]
+            row[f"stats/{col}/std"] = [float(np.std(arr))]
+            row[f"stats/{col}/count"] = [len(arr)]
+            for q in [0.01, 0.10, 0.50, 0.90, 0.99]:
+                qname = f"q{int(q*100):02d}"
+                row[f"stats/{col}/{qname}"] = [float(np.quantile(arr, q))]
+        row["meta/episodes/chunk_index"] = 0
+        row["meta/episodes/file_index"] = 0
+        ep_rows.append(row)
+        cumulative_index += length
+
+    ep_df = pd.DataFrame(ep_rows)
+    ep_out_dir = meta_dir / "episodes" / "chunk-000"
+    ep_out_dir.mkdir(parents=True, exist_ok=True)
+    ep_df.to_parquet(ep_out_dir / "file-000.parquet", index=False)
+    log.info("  Wrote episodes parquet (%d episodes, %d columns)", len(ep_df), len(ep_df.columns))
 
     # ------------------------------------------------------------------
     # Phase 7: Verification
