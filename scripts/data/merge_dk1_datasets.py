@@ -79,6 +79,8 @@ EXCLUDE_NAMES = {
     "qualiaadmin_pingpongmegamerge",
     # Bad data: wrong camera streams for context & left_wrist (show operator)
     "qualiaadmin_spoon1",
+    # No video files at all (incomplete upload)
+    "Gongsta_dagger_dk1_tshirt_corrections",
 }
 
 # Overview camera names → normalised name "top"
@@ -144,6 +146,18 @@ def get_action_dim(info: dict) -> int:
     return shape[0] if isinstance(shape, list) else shape
 
 
+def get_state_dim(info: dict) -> int:
+    """Get state dimensionality from info.json."""
+    features = info.get("features", {})
+    state_feat = features.get("observation.state", {})
+    shape = state_feat.get("shape", [0])
+    return shape[0] if isinstance(shape, list) else shape
+
+
+# Indices to extract 14D joint positions from 40D state (pos/vel/torque interleaved)
+STATE_40D_POS_INDICES = [0, 3, 6, 9, 12, 15, 18, 20, 23, 26, 29, 32, 35, 38]
+
+
 def discover_datasets(data_root: Path) -> tuple[list[dict], list[dict]]:
     """Discover and filter datasets. Returns (included, excluded) lists."""
     included = []
@@ -197,12 +211,15 @@ def discover_datasets(data_root: Path) -> tuple[list[dict], list[dict]]:
             excluded.append({"name": name, "reason": "no parquet files"})
             continue
 
+        state_dim = get_state_dim(info)
+
         included.append({
             "name": name,
             "path": ds_dir,
             "info": info,
             "cam_info": cam_info,
             "action_dim": action_dim,
+            "state_dim": state_dim,
             "parquet_files": parquet_files,
             "total_frames": total_frames,
             "fps": info.get("fps", DEFAULT_FPS),
@@ -310,13 +327,14 @@ def merge_tasks(datasets: list[dict]) -> tuple[list[dict], dict[str, dict[str, d
 def split_parquet_by_episode(
     source_parquet: Path,
     action_dim: int,
+    state_dim: int,
     fps: float,
     task_remap: dict[int, int],
 ) -> list[tuple[pd.DataFrame, int, int]]:
     """Split a source parquet file into per-episode DataFrames.
 
     Returns list of (episode_df, original_episode_index, global_row_start_in_file).
-    Each episode_df has action sliced, task_index remapped, but episode_index/index/
+    Each episode_df has action/state sliced, task_index remapped, but episode_index/index/
     frame_index/timestamp are NOT yet set (caller assigns global values).
     """
     df = pd.read_parquet(source_parquet)
@@ -324,6 +342,17 @@ def split_parquet_by_episode(
     # Slice action to 14D if needed
     if action_dim > TARGET_ACTION_DIM:
         df["action"] = df["action"].apply(lambda a: np.array(a)[:TARGET_ACTION_DIM])
+
+    # Slice state to 14D if needed (extract joint positions from pos/vel/torque layout)
+    if state_dim > TARGET_STATE_DIM:
+        if state_dim == 40:
+            df["observation.state"] = df["observation.state"].apply(
+                lambda s: np.array(s)[STATE_40D_POS_INDICES]
+            )
+        else:
+            df["observation.state"] = df["observation.state"].apply(
+                lambda s: np.array(s)[:TARGET_STATE_DIM]
+            )
 
     # Remap task_index
     if "task_index" in df.columns:
@@ -1152,99 +1181,67 @@ def main():
     log.info("  %d unique tasks across all datasets", len(tasks))
 
     # ------------------------------------------------------------------
-    # Phase 4 + 5: Per-episode parquet split + video extraction
+    # Phase 4: Collect all episodes (two-pass: collect, shuffle, write)
     # ------------------------------------------------------------------
-    log.info("\nPhase 4+5: Splitting per-episode (parquet + video)")
+    log.info("\nPhase 4: Collecting episodes from all datasets")
     output_path.mkdir(parents=True, exist_ok=True)
 
-    global_episode_index = 0
-    global_frame_index = 0
-    episodes_meta: list[dict] = []
-    video_jobs: list[tuple] = []
-    skipped_videos = 0
-    skipped_parquets = 0
+    # Pass 1: collect all episode records without assigning global indices.
+    # Uses episodes parquet metadata to locate each episode's video segment
+    # (file_index + from_timestamp), which works for all dataset layouts.
+    all_episodes: list[dict] = []
 
-    for ds in tqdm(included, desc="Datasets"):
+    for ds in tqdm(included, desc="Collecting"):
         ds_task_remap = task_remap[ds["name"]]
         overview_cam = ds["cam_info"]["overview"]
 
-        # Build video frame maps for this dataset (one per camera)
-        # Map source camera names to target names using CAM_NAME_REMAP
-        wrist_cams = ds["cam_info"]["wrists"]  # e.g. ["camera_1", "camera_2"] or ["left_wrist", "right_wrist"]
+        # Build camera mapping (source cam name → target cam name)
+        wrist_cams = ds["cam_info"]["wrists"]
         cam_mapping = {
             f"observation.images.{overview_cam}": "observation.images.head",
         }
         for wc in wrist_cams:
             target = CAM_NAME_REMAP.get(wc, wc)
             cam_mapping[f"observation.images.{wc}"] = f"observation.images.{target}"
-        cam_frame_maps: dict[str, list[tuple[Path, int, int]]] = {}
-        if not args.skip_videos:
-            for src_cam_key in cam_mapping:
-                cam_frame_maps[src_cam_key] = build_source_video_frame_map(
-                    ds["path"], src_cam_key,
-                )
 
-        # Detect 1:1 layout: each parquet file has exactly one episode and
-        # corresponds to a matching video file (which may have extra frames).
-        # In this case we use direct file-to-file mapping instead of cumulative offsets.
-        is_one_to_one = (
-            len(ds["parquet_files"]) > 1
-            and all(
-                len(pd.read_parquet(pf, columns=["episode_index"])["episode_index"].unique()) == 1
-                for pf in ds["parquet_files"][:3]  # sample first 3 to detect
-            )
-        )
-        if is_one_to_one:
-            log.info("  %s: detected 1:1 layout (one episode per file)", ds["name"])
-
-        # Load per-episode video timestamps from episodes parquet (if available).
-        # Maps (episode_index, cam_key) -> from_timestamp for seeking into video.
-        ep_video_offsets: dict[tuple[int, str], float] = {}
-        ep_parquet_path = ds["path"] / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
-        if ep_parquet_path.exists():
-            ep_meta_df = pd.read_parquet(ep_parquet_path)
+        # Load episodes metadata (video file_index + from_timestamp per episode per camera)
+        ep_video_meta: dict[int, dict] = {}  # episode_index -> {cam_key: {file_index, from_ts}}
+        for ep_pq in sorted((ds["path"] / "meta" / "episodes").rglob("*.parquet")):
+            ep_meta_df = pd.read_parquet(ep_pq)
             for _, row in ep_meta_df.iterrows():
                 ep_i = int(row["episode_index"])
+                cam_meta = {}
                 for src_cam_key in cam_mapping:
-                    ts_col = f"videos/{src_cam_key}/from_timestamp"
-                    if ts_col in ep_meta_df.columns:
-                        ep_video_offsets[(ep_i, src_cam_key)] = float(row[ts_col])
+                    fi_col = f"videos/{src_cam_key}/file_index"
+                    ci_col = f"videos/{src_cam_key}/chunk_index"
+                    ft_col = f"videos/{src_cam_key}/from_timestamp"
+                    if fi_col in ep_meta_df.columns and ft_col in ep_meta_df.columns:
+                        cam_meta[src_cam_key] = {
+                            "file_index": int(row[fi_col]),
+                            "chunk_index": int(row[ci_col]) if ci_col in ep_meta_df.columns else 0,
+                            "from_timestamp": float(row[ft_col]),
+                        }
+                ep_video_meta[ep_i] = cam_meta
 
-        # Track cumulative row offset across parquet files within this dataset.
-        # Used for packed layout where multiple episodes are concatenated in video files.
-        ds_row_offset = 0
+        has_video_meta = len(ep_video_meta) > 0
+        if not has_video_meta:
+            log.warning("  %s: no episodes parquet — video mapping may be unreliable", ds["name"])
 
         for pf in ds["parquet_files"]:
-            # Split this parquet into individual episodes
             episodes = split_parquet_by_episode(
                 source_parquet=pf,
                 action_dim=ds["action_dim"],
+                state_dim=ds["state_dim"],
                 fps=ds["fps"],
                 task_remap=ds_task_remap,
             )
 
-            # Count total rows in this parquet file for advancing ds_row_offset
-            file_total_rows = sum(len(ep_df) for ep_df, _, _ in episodes)
-
             for ep_df, orig_ep_idx, row_offset_in_file in episodes:
                 n_frames = len(ep_df)
-                if n_frames < 10:  # Skip tiny episodes
+                if n_frames < 10:
                     continue
 
-                chunk_idx = global_episode_index // CHUNKS_SIZE
-                file_idx = global_episode_index % CHUNKS_SIZE
-                out_pq = output_path / f"data/chunk-{chunk_idx:03d}/file-{file_idx:03d}.parquet"
-
-                # Write parquet
-                if args.resume and out_pq.exists():
-                    skipped_parquets += 1
-                    n_frames = len(pd.read_parquet(out_pq, columns=["frame_index"]))
-                else:
-                    n_frames = write_episode_parquet(
-                        ep_df, out_pq, global_episode_index, global_frame_index, ds["fps"],
-                    )
-
-                # Collect task strings for this episode
+                # Collect task strings
                 ep_task_indices = set()
                 if "task_index" in ep_df.columns:
                     for tidx in ep_df["task_index"].unique():
@@ -1255,69 +1252,116 @@ def main():
                 if not ep_tasks:
                     ep_tasks = [tasks[0]["task"] if tasks else ""]
 
-                episodes_meta.append({
-                    "episode_index": global_episode_index,
+                # Build video source info using episodes metadata
+                video_sources = []
+                if not args.skip_videos:
+                    cam_meta = ep_video_meta.get(orig_ep_idx, {})
+                    for src_cam_key, dst_cam_key in cam_mapping.items():
+                        meta = cam_meta.get(src_cam_key)
+                        if meta is not None:
+                            # Use metadata: exact video file + timestamp
+                            chunk_i = meta["chunk_index"]
+                            file_i = meta["file_index"]
+                            from_ts = meta["from_timestamp"]
+                            src_video = (
+                                ds["path"] / "videos" / src_cam_key
+                                / f"chunk-{chunk_i:03d}" / f"file-{file_i:03d}.mp4"
+                            )
+                        else:
+                            # Fallback: assume parquet file maps to same-named video file
+                            src_video = (
+                                ds["path"] / "videos" / src_cam_key
+                                / pf.parent.name / f"{pf.stem}.mp4"
+                            )
+                            from_ts = 0.0
+
+                        if not src_video.exists():
+                            log.warning("Missing source video: %s (ep %d)", src_video, orig_ep_idx)
+                            continue
+
+                        video_sources.append({
+                            "src_video": str(src_video),
+                            "dst_cam_key": dst_cam_key,
+                            "from_timestamp": from_ts,
+                            "n_frames": n_frames,
+                            "fps": ds["fps"],
+                        })
+
+                all_episodes.append({
+                    "ep_df": ep_df,
                     "tasks": ep_tasks,
-                    "length": n_frames,
                     "fps": ds["fps"],
+                    "n_frames": n_frames,
+                    "video_sources": video_sources,
+                    "source_dataset": ds["name"],
                 })
 
-                # Queue video extraction jobs
-                if not args.skip_videos:
-                    if is_one_to_one:
-                        # 1:1 layout: source video file matches parquet file directly.
-                        # Respects from_timestamp to skip leading frames if needed.
-                        pf_chunk = pf.parent.name  # e.g. "chunk-000"
-                        pf_stem = pf.stem  # e.g. "file-000"
-                        for src_cam_key, dst_cam_key in cam_mapping.items():
-                            dst_video = (
-                                output_path / "videos" / dst_cam_key
-                                / f"chunk-{chunk_idx:03d}" / f"file-{file_idx:03d}.mp4"
-                            )
-                            if args.resume and dst_video.exists():
-                                skipped_videos += 1
-                                continue
-                            src_video = ds["path"] / "videos" / src_cam_key / pf_chunk / f"{pf_stem}.mp4"
-                            if not src_video.exists():
-                                log.warning("Missing source video: %s", src_video)
-                                continue
-                            # Use from_timestamp to compute starting frame offset
-                            from_ts = ep_video_offsets.get((orig_ep_idx, src_cam_key), 0.0)
-                            frame_offset = round(from_ts * ds["fps"])
-                            fm_serialized = [(str(src_video), 0, frame_offset + n_frames + 100)]
-                            video_jobs.append((
-                                fm_serialized, frame_offset, n_frames,
-                                str(dst_video), args.target_width, args.target_height, ds["fps"],
-                            ))
-                    else:
-                        # Packed layout: cumulative offset into concatenated video stream
-                        video_global_start = ds_row_offset + row_offset_in_file
+    log.info("  Collected %d episodes from %d datasets", len(all_episodes), len(included))
 
-                        for src_cam_key, dst_cam_key in cam_mapping.items():
-                            dst_video = (
-                                output_path / "videos" / dst_cam_key
-                                / f"chunk-{chunk_idx:03d}" / f"file-{file_idx:03d}.mp4"
-                            )
+    # Shuffle episodes for better training diversity
+    import random
+    random.seed(42)
+    random.shuffle(all_episodes)
+    log.info("  Shuffled episode order (seed=42)")
 
-                            if args.resume and dst_video.exists():
-                                skipped_videos += 1
-                                continue
+    # ------------------------------------------------------------------
+    # Phase 5: Write shuffled episodes (parquet + video)
+    # ------------------------------------------------------------------
+    log.info("\nPhase 5: Writing shuffled episodes (parquet + video)")
 
-                            frame_map = cam_frame_maps.get(src_cam_key, [])
-                            if not frame_map:
-                                continue
+    global_episode_index = 0
+    global_frame_index = 0
+    episodes_meta: list[dict] = []
+    video_jobs: list[tuple] = []
+    skipped_videos = 0
+    skipped_parquets = 0
 
-                            # Serialize frame_map for multiprocessing
-                            fm_serialized = [(str(p), cs, nf) for p, cs, nf in frame_map]
-                            video_jobs.append((
-                                fm_serialized, video_global_start, n_frames,
-                                str(dst_video), args.target_width, args.target_height, ds["fps"],
-                            ))
+    for ep_record in all_episodes:
+        ep_df = ep_record["ep_df"]
+        n_frames = ep_record["n_frames"]
+        ep_fps = ep_record["fps"]
 
-                global_frame_index += n_frames
-                global_episode_index += 1
+        chunk_idx = global_episode_index // CHUNKS_SIZE
+        file_idx = global_episode_index % CHUNKS_SIZE
+        out_pq = output_path / f"data/chunk-{chunk_idx:03d}/file-{file_idx:03d}.parquet"
 
-            ds_row_offset += file_total_rows
+        # Write parquet
+        if args.resume and out_pq.exists():
+            skipped_parquets += 1
+            n_frames = len(pd.read_parquet(out_pq, columns=["frame_index"]))
+        else:
+            n_frames = write_episode_parquet(
+                ep_df, out_pq, global_episode_index, global_frame_index, ep_fps,
+            )
+
+        episodes_meta.append({
+            "episode_index": global_episode_index,
+            "tasks": ep_record["tasks"],
+            "length": n_frames,
+            "fps": ep_fps,
+        })
+
+        # Queue video extraction jobs — each source has src_video + from_timestamp
+        for vs in ep_record["video_sources"]:
+            dst_video = (
+                output_path / "videos" / vs["dst_cam_key"]
+                / f"chunk-{chunk_idx:03d}" / f"file-{file_idx:03d}.mp4"
+            )
+
+            if args.resume and dst_video.exists():
+                skipped_videos += 1
+                continue
+
+            # All video sources use the same format: seek to from_timestamp, extract n_frames
+            frame_offset = round(vs["from_timestamp"] * vs["fps"])
+            fm_serialized = [(vs["src_video"], 0, frame_offset + n_frames + 100)]
+            video_jobs.append((
+                fm_serialized, frame_offset, n_frames,
+                str(dst_video), args.target_width, args.target_height, vs["fps"],
+            ))
+
+        global_frame_index += n_frames
+        global_episode_index += 1
 
     total_episodes = global_episode_index
     total_frames = global_frame_index
@@ -1330,39 +1374,15 @@ def main():
         # Group video_jobs by source video file for batch processing
         # video_jobs contains: (fm_serialized, video_global_start, n_frames, dst_path, tw, th, fps)
         # We need to reorganize: for each source video file → list of (local_start, n_frames, output_path)
-        from collections import defaultdict
-        # (src_path -> (episode_splits, fps))
+        # Group jobs by source video file for batch processing.
+        # All jobs are now single-file with a local frame offset (from episodes metadata).
         batch_jobs: dict[str, tuple[list[tuple[int, int, str]], int]] = {}
 
-        crossfile_jobs = []  # fallback jobs for episodes spanning multiple files
-
-        for fm_serialized, video_global_start, n_frames, dst_path, tw, th, fps_val in video_jobs:
-            # Find which source video file(s) contain these frames
-            global_end = video_global_start + n_frames
-            matched = False
-            for src_path_str, cum_start, file_nframes in fm_serialized:
-                cum_end = cum_start + file_nframes
-                if video_global_start >= cum_start and video_global_start < cum_end:
-                    local_start = video_global_start - cum_start
-                    if local_start + n_frames <= file_nframes:
-                        # Episode fits entirely in this file — use batch path
-                        if src_path_str not in batch_jobs:
-                            batch_jobs[src_path_str] = ([], fps_val)
-                        batch_jobs[src_path_str][0].append((local_start, n_frames, dst_path))
-                    else:
-                        # Episode spans files — queue for sequential extraction
-                        log.warning("Episode spans video files at %s frame %d — using fallback", src_path_str, video_global_start)
-                        crossfile_jobs.append((fm_serialized, video_global_start, n_frames, dst_path, tw, th, fps_val))
-                    matched = True
-                    break
-
-            if not matched:
-                log.error("No source video found for frame %d in %s", video_global_start, dst_path)
-
-        # Process cross-file episodes sequentially (rare case)
-        for fm_serialized, video_global_start, n_frames, dst_path, tw, th, fps_val in crossfile_jobs:
-            frame_map = [(Path(p), cs, nf) for p, cs, nf in fm_serialized]
-            extract_episode_video(frame_map, video_global_start, n_frames, Path(dst_path), tw, th, fps_val)
+        for fm_serialized, frame_offset, n_frames, dst_path, tw, th, fps_val in video_jobs:
+            src_path_str = fm_serialized[0][0]  # single source file
+            if src_path_str not in batch_jobs:
+                batch_jobs[src_path_str] = ([], fps_val)
+            batch_jobs[src_path_str][0].append((frame_offset, n_frames, dst_path))
 
         total_batch_episodes = sum(len(eps) for eps, _ in batch_jobs.values())
         log.info("  Batch splitting: %d source videos → %d episode videos (%d workers)",
@@ -1516,12 +1536,7 @@ Merged and deduplicated DK-1 bimanual robot dataset. All source videos are re-en
 | Dataset |
 |---|
 {chr(10).join(source_rows)}
-
-## Excluded Datasets
-
-| Dataset | Reason |
-|---|---|
-""" + "\n".join(f"| {ex['name']} | {ex['reason']} |" for ex in excluded) + "\n"
+"""
 
     with open(output_path / "README.md", "w") as f:
         f.write(readme)
